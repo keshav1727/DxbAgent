@@ -1,7 +1,9 @@
 const TelegramBot = require('node-telegram-bot-api');
+const fs = require('fs');
 const config = require('../config');
-const { generateResponse } = require('./ai');
-const { processAudioFromUrl } = require('./audio');
+const { generateResponse, translateText } = require('./ai');
+const { processAudioFromUrl, textToSpeech, isTranslationRequest, extractTargetLanguage } = require('./audio');
+const { addMessage, getMessages, handleTopicChange } = require('../utils/memory');
 
 let bot = null;
 
@@ -59,12 +61,56 @@ function init() {
         const transcribedText = await processAudioFromUrl(fileUrl, fileId);
 
         if (transcribedText) {
-          await bot.sendMessage(chatId, `🎤 *You said:* "${transcribedText}"`, { parse_mode: 'Markdown' });
+          // Check if it's a translation request
+          if (isTranslationRequest(transcribedText)) {
+            const targetLang = extractTargetLanguage(transcribedText) || 'English';
+            // Extract the text to translate (remove translation keywords)
+            const textToTranslate = transcribedText.replace(/translate|translation|convert|say|speak|to \w+|in \w+/gi, '').trim();
+            console.log(`🌐 Translating to ${targetLang}: "${textToTranslate}"`);
 
-          await bot.sendChatAction(chatId, 'typing');
-          const response = await generateResponse(transcribedText);
-          await sendLongMessage(chatId, response);
-          console.log('✅ Voice response sent');
+            // 1. Show what user said
+            await bot.sendMessage(chatId, `🎤 *You said:* "${textToTranslate}"`, { parse_mode: 'Markdown' });
+
+            // 2. Get and send translation
+            await bot.sendChatAction(chatId, 'typing');
+            const response = await translateText(textToTranslate, targetLang);
+
+            if (response) {
+              await sendLongMessage(chatId, response);
+            } else {
+              await bot.sendMessage(chatId, '❌ Translation failed. Please try again.');
+              return;
+            }
+
+            // Generate audio for the translation
+            await bot.sendChatAction(chatId, 'record_voice');
+            const audioPath = `/tmp/tts_${Date.now()}.mp3`;
+            const audioFile = await textToSpeech(response, audioPath);
+
+            if (audioFile) {
+              await bot.sendVoice(chatId, audioFile);
+              fs.unlink(audioFile, () => {});
+            }
+
+            console.log('✅ Translation with audio sent');
+          } else {
+            // Regular voice message - show transcription + response with context
+            await bot.sendMessage(chatId, `🎤 *You said:* "${transcribedText}"`, { parse_mode: 'Markdown' });
+            await bot.sendChatAction(chatId, 'typing');
+
+            // Check for topic change and clear history if needed
+            handleTopicChange(chatId, transcribedText);
+
+            const history = getMessages(chatId);
+            const response = await generateResponse(transcribedText, history, chatId);
+
+            // Save to memory
+            addMessage(chatId, 'user', transcribedText);
+            addMessage(chatId, 'assistant', response);
+
+            await sendLongMessage(chatId, response);
+            console.log('✅ Voice response sent');
+          }
         } else {
           await bot.sendMessage(chatId, '❌ Sorry, I couldn\'t understand the audio. Please try again.');
         }
@@ -91,7 +137,7 @@ function init() {
           await bot.sendMessage(chatId, `🎤 *Transcription:* "${transcribedText}"`, { parse_mode: 'Markdown' });
 
           await bot.sendChatAction(chatId, 'typing');
-          const response = await generateResponse(transcribedText);
+          const response = await generateResponse(transcribedText, [], chatId);
           await sendLongMessage(chatId, response);
           console.log('✅ Audio response sent');
         } else {
@@ -123,16 +169,54 @@ function init() {
     }
 
     await bot.sendChatAction(chatId, 'typing');
-    const response = await generateResponse(fullContext);
-    await sendLongMessage(chatId, response);
-    console.log('✅ Telegram response sent');
+
+    // Check if text message is a translation request
+    if (isTranslationRequest(messageText)) {
+      const targetLang = extractTargetLanguage(messageText) || 'English';
+      const textToTranslate = messageText.replace(/translate|translation|convert|say|speak|to \w+|in \w+/gi, '').trim();
+      console.log(`🌐 Translating to ${targetLang}: "${textToTranslate}"`);
+
+      const response = await translateText(textToTranslate, targetLang);
+      if (response) {
+        await sendLongMessage(chatId, response);
+      } else {
+        await bot.sendMessage(chatId, '❌ Translation failed.');
+        return;
+      }
+
+      // Generate audio
+      await bot.sendChatAction(chatId, 'record_voice');
+      const audioPath = `/tmp/tts_${Date.now()}.mp3`;
+      const audioFile = await textToSpeech(response, audioPath);
+
+      if (audioFile) {
+        await bot.sendVoice(chatId, audioFile);
+        fs.unlink(audioFile, () => {});
+      }
+
+      console.log('✅ Translation with audio sent');
+    } else {
+      // Check for topic change and clear history if needed
+      handleTopicChange(chatId, messageText);
+
+      // Get conversation history and generate response with context
+      const history = getMessages(chatId);
+      const response = await generateResponse(fullContext, history, chatId);
+
+      // Save to memory
+      addMessage(chatId, 'user', fullContext);
+      addMessage(chatId, 'assistant', response);
+
+      await sendLongMessage(chatId, response);
+      console.log('✅ Telegram response sent');
+    }
   });
 
   bot.on('polling_error', (error) => {
     console.error('❌ Telegram Polling error:', error.message);
   });
 
-  console.log('📱 Telegram: Polling mode active (Voice enabled)');
+  console.log('📱 Telegram: Polling mode active (Voice + TTS enabled)');
   return bot;
 }
 

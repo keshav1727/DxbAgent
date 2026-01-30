@@ -2,6 +2,8 @@ const express = require('express');
 const config = require('./src/config');
 const telegram = require('./src/services/telegram');
 const whatsapp = require('./src/services/whatsapp');
+const googleflights = require('./src/services/googleflights');
+const googlehotels = require('./src/services/googlehotels');
 
 console.log('🤖 Multi-Platform AI Agent starting...');
 
@@ -10,8 +12,10 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Initialize Telegram
+// Initialize services
 telegram.init();
+const flightsEnabled = googleflights.init();
+const hotelsEnabled = googlehotels.init();
 
 // WhatsApp webhook
 app.post('/webhook/whatsapp', whatsapp.handleWebhook);
@@ -30,6 +34,8 @@ console.log('✅ Agent is running!');
 console.log('📱 Telegram: Active');
 console.log('💬 WhatsApp: Active');
 console.log('🔍 Tavily: Real-time search');
+console.log(`✈️ Google Flights: ${flightsEnabled ? 'Real-time flights' : 'Not configured'}`);
+console.log(`🏨 Google Hotels: ${hotelsEnabled ? 'Real-time hotels' : 'Not configured'}`);
 console.log('🤖 GPT-4.1 AI');
 console.log('');
 console.log('🎯 Capabilities: Flights, Visa, Weather, News, Search');

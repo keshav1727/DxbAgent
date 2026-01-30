@@ -15,6 +15,9 @@ module.exports = {
   tavily: {
     apiKey: process.env.TAVILY_API_KEY,
   },
+  serpapi: {
+    apiKey: process.env.SERPAPI_KEY,
+  },
   server: {
     port: process.env.PORT || 3001,
   },

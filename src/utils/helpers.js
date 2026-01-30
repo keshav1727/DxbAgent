@@ -40,7 +40,32 @@ function needsSearch(text) {
     'train', 'bus', 'transport',
     'stock', 'crypto', 'bitcoin', 'market',
   ];
+
+  // Also detect flight route patterns like "from X to Y"
+  const flightRoutePattern = /from\s+\w+\s+to\s+\w+/i;
+  if (flightRoutePattern.test(text)) {
+    return true;
+  }
+
   return keywords.some((k) => lower.includes(k));
 }
 
-module.exports = { splitMessage, needsSearch };
+// Check if message is a flight-related query
+function isFlightQuery(text) {
+  const lower = text.toLowerCase();
+
+  // Direct flight keywords
+  if (lower.includes('flight') || lower.includes('fly to') || lower.includes('airplane')) {
+    return true;
+  }
+
+  // Route pattern: "from X to Y"
+  const routePattern = /from\s+\w+\s+to\s+\w+/i;
+  if (routePattern.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+module.exports = { splitMessage, needsSearch, isFlightQuery };

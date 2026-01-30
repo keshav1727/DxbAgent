@@ -2,9 +2,46 @@ const { generateText } = require('ai');
 const { openai } = require('@ai-sdk/openai');
 const { tavily } = require('@tavily/core');
 const config = require('../config');
-const { needsSearch } = require('../utils/helpers');
+const { needsSearch, isFlightQuery } = require('../utils/helpers');
+const { searchFlights, formatFlightResults } = require('./googleflights');
+const { searchHotels, formatHotelResults, getMissingHotelInfo, buildHotelPrompt } = require('./googlehotels');
+const { getTopic } = require('../utils/memory');
 
 const tavilyClient = tavily({ apiKey: config.tavily.apiKey });
+
+// Store last flight search results for follow-up queries
+const lastFlightResults = new Map();
+
+// Store pending hotel queries waiting for missing info
+const pendingHotelQueries = new Map();
+
+// Store last completed hotel query so follow-ups can build on it
+const lastHotelQuery = new Map();
+
+// Direct translation function - returns ONLY the translated text
+async function translateText(text, targetLanguage) {
+  try {
+    const { text: translation } = await generateText({
+      model: openai(config.openai.model),
+      messages: [
+        {
+          role: 'system',
+          content: `You are a translator. Output ONLY the translated text. No explanations. No pronunciation. No alternatives. No quotes. No extra words. Just the direct translation.`
+        },
+        {
+          role: 'user',
+          content: `Translate to ${targetLanguage}: ${text}`
+        }
+      ],
+      temperature: 0.3,
+      maxTokens: 500,
+    });
+    return translation.trim();
+  } catch (error) {
+    console.error('❌ Translation Error:', error.message);
+    return null;
+  }
+}
 
 // Detect query type for specialized handling
 function detectQueryType(text) {
@@ -120,41 +157,44 @@ function buildSearchContext(results) {
 }
 
 // Specialized prompts for better output
-function getSystemPrompt(type, searchContext) {
+function getSystemPrompt(type, searchContext, flightData = null) {
   const baseContext = searchContext
     ? `Use these search results:\n\n${searchContext}\n\n`
     : '';
 
+  // Build flight context from Google Flights data for follow-up queries
+  let flightContext = '';
+  if (flightData && flightData.flights) {
+    flightContext = `Here is the REAL flight data from Google Flights. Use ONLY this data to answer:\n\n`;
+    flightContext += `Route: ${flightData.route.origin} → ${flightData.route.destination}\n`;
+    flightContext += `Date: ${flightData.route.date}\n\n`;
+    flightContext += `Available Flights:\n`;
+    flightData.flights.forEach((f) => {
+      flightContext += `${f.rank}. ${f.airline} ${f.flightNumber}\n`;
+      flightContext += `   Departure: ${f.departure.time} from ${f.departure.airport}\n`;
+      flightContext += `   Arrival: ${f.arrival.time} at ${f.arrival.airport}\n`;
+      flightContext += `   Duration: ${f.duration}\n`;
+      flightContext += `   Stops: ${f.stops === 0 ? 'Non-stop' : f.stops + ' stop(s) via ' + f.stopDetails.join(', ')}\n`;
+      if (f.price.economy > 0) {
+        flightContext += `   Economy Price: ₹${f.price.economy.toLocaleString('en-IN')}\n`;
+      } else {
+        flightContext += `   Economy Price: Not available\n`;
+      }
+      if (f.price.premiumEconomy && f.price.premiumEconomy > 0) {
+        flightContext += `   Premium Economy: ₹${f.price.premiumEconomy.toLocaleString('en-IN')}\n`;
+      }
+      flightContext += `   Aircraft: ${f.airplane}\n`;
+      if (f.legroom && f.legroom !== 'N/A') {
+        flightContext += `   Legroom: ${f.legroom}\n`;
+      }
+      flightContext += `\n`;
+    });
+  }
+
   const prompts = {
-    flight: `${baseContext}You are a flight search assistant. Show ALL available flights in a detailed table format.
-
-**✈️ Available Flights:**
-
-List EVERY flight found in this format:
-
-┌─────────────────────────────────────────────┐
-│ 1. [Airline Name] - [Flight Number]         │
-├─────────────────────────────────────────────┤
-│ 🛫 Departure: [Time] from [City/Airport]    │
-│ 🛬 Arrival: [Time] at [City/Airport]        │
-│ ⏱️ Duration: [X hr Y min]                   │
-│ 💰 Price: ₹[Amount] / $[Amount]             │
-│ ✈️ Type: Non-stop / 1 Stop / 2 Stops        │
-│ 📅 Date: [Travel Date]                      │
-└─────────────────────────────────────────────┘
-
-Repeat this format for EACH flight option (show at least 5-10 flights if available).
-
-**📊 Summary:**
-• Cheapest: [Airline] at [Price]
-• Fastest: [Airline] at [Duration]
-• Best Value: [Recommendation]
-
-**💡 Booking Tips:**
-• Where to book for best price
-• Best time to fly
-
-IMPORTANT: Show ALL flights with exact times, don't summarize. Users need complete flight schedules.`,
+    flight: flightData
+      ? `${flightContext}\nYou are a flight assistant. Answer the user's question using ONLY the flight data above. Be specific with flight numbers, times, and prices. Do not make up any information.`
+      : `${baseContext}You are a flight search assistant. If you don't have real flight data, ask the user to search for flights with origin, destination and date.`,
 
     hotel: `${baseContext}You are a hotel search assistant. Show hotels with EXACT prices from booking platforms.
 
@@ -223,12 +263,81 @@ Keep it brief and useful.`,
   return prompts[type] || prompts.general;
 }
 
-async function generateResponse(messageText) {
+async function generateResponse(messageText, conversationHistory = [], chatId = 'default') {
   try {
     const queryType = detectQueryType(messageText);
     let searchContext = '';
+    let flightData = null;
 
-    if (needsSearch(messageText)) {
+    // Use Google Flights for flight searches
+    if (isFlightQuery(messageText) && needsSearch(messageText)) {
+      console.log(`✈️ Searching flights via Google Flights...`);
+      const flightResults = await searchFlights(messageText);
+
+      if (flightResults.success) {
+        // Store results for follow-up queries
+        lastFlightResults.set(chatId, flightResults);
+
+        // Return formatted flight data directly
+        return formatFlightResults(flightResults);
+      } else if (flightResults.error) {
+        // If Google Flights fails, fall back to web search
+        console.log(`⚠️ Google Flights: ${flightResults.error}, falling back to web search`);
+        const results = await searchWeb(messageText, queryType);
+        if (results) {
+          searchContext = buildSearchContext(results);
+        }
+      }
+    } else if (queryType === 'flight' && lastFlightResults.has(chatId)) {
+      // Follow-up query about flights - use stored results
+      flightData = lastFlightResults.get(chatId);
+      console.log(`✈️ Using cached flight data for follow-up`);
+    } else if (
+      queryType === 'hotel' ||
+      pendingHotelQueries.has(chatId) ||
+      (getTopic(chatId) === 'hotel' && queryType === 'general')
+    ) {
+      // Hotel conversation — continues as long as topic is 'hotel'
+      let fullQuery = messageText;
+
+      if (pendingHotelQueries.has(chatId) && queryType !== 'hotel') {
+        // User is providing missing info (e.g., "under 10k", "tomorrow")
+        const previousQuery = pendingHotelQueries.get(chatId);
+        fullQuery = `${previousQuery} ${messageText}`;
+        console.log(`🏨 Combined query: "${fullQuery}"`);
+      } else if (getTopic(chatId) === 'hotel' && queryType === 'general' && lastHotelQuery.has(chatId)) {
+        // Follow-up on completed hotel search (e.g., "for 1st feb", "show 3 star")
+        const previousQuery = lastHotelQuery.get(chatId);
+        fullQuery = `${previousQuery} ${messageText}`;
+        console.log(`🏨 Follow-up query: "${fullQuery}"`);
+      }
+
+      // Check if hotel query has all required info
+      const { missing } = getMissingHotelInfo(fullQuery);
+
+      if (missing.length > 0) {
+        // Store partial query and ask for missing info
+        pendingHotelQueries.set(chatId, fullQuery);
+        console.log(`🏨 Hotel query missing: ${missing.join(', ')}`);
+        return buildHotelPrompt(missing);
+      }
+
+      // All info available — clear pending, save query, and search
+      pendingHotelQueries.delete(chatId);
+      lastHotelQuery.set(chatId, fullQuery);
+      console.log(`🏨 Searching hotels via Google Hotels...`);
+      const hotelResults = await searchHotels(fullQuery);
+
+      if (hotelResults.success) {
+        return formatHotelResults(hotelResults);
+      } else if (hotelResults.error) {
+        console.log(`⚠️ Google Hotels: ${hotelResults.error}, falling back to web search`);
+        const results = await searchWeb(messageText, queryType);
+        if (results) {
+          searchContext = buildSearchContext(results);
+        }
+      }
+    } else if (needsSearch(messageText)) {
       console.log(`🌐 Real-time search needed (${queryType})...`);
       const results = await searchWeb(messageText, queryType);
       if (results) {
@@ -236,14 +345,25 @@ async function generateResponse(messageText) {
       }
     }
 
-    const systemPrompt = getSystemPrompt(queryType, searchContext);
+    let systemPrompt = getSystemPrompt(queryType, searchContext, flightData);
+
+    // Add context instruction for follow-up questions
+    systemPrompt += `\n\nIMPORTANT: Maintain conversation continuity. If the user asks follow-up questions like "which is cheapest?", "tell me more", "what about budget options?", etc., refer to the previous context. Do not switch topics unless the user explicitly asks about something completely different.`;
+
+    // Build messages array with history
+    const messages = [{ role: 'system', content: systemPrompt }];
+
+    // Add conversation history
+    for (const msg of conversationHistory) {
+      messages.push({ role: msg.role, content: msg.content });
+    }
+
+    // Add current message
+    messages.push({ role: 'user', content: messageText });
 
     const { text } = await generateText({
       model: openai(config.openai.model),
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: messageText },
-      ],
+      messages,
       temperature: 0.7,
       maxTokens: 2500,
     });
@@ -265,4 +385,4 @@ async function generateResponse(messageText) {
   }
 }
 
-module.exports = { generateResponse };
+module.exports = { generateResponse, translateText };

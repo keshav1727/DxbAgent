@@ -1,10 +1,26 @@
 const twilio = require('twilio');
+const fs = require('fs');
 const config = require('../config');
-const { generateResponse } = require('./ai');
+const { generateResponse, translateText } = require('./ai');
 const { splitMessage } = require('../utils/helpers');
-const { processAudioFromUrl } = require('./audio');
+const { processAudioFromUrl, textToSpeech, isTranslationRequest, extractTargetLanguage } = require('./audio');
+const { addMessage, getMessages, handleTopicChange } = require('../utils/memory');
 
 const client = twilio(config.twilio.accountSid, config.twilio.authToken);
+
+// Upload audio to a public URL for Twilio (using file hosting)
+async function sendWhatsAppAudio(to, from, audioPath, caption) {
+  try {
+    // For WhatsApp, we need a publicly accessible URL
+    // Since we can't host files easily, we'll send the transcription text instead
+    // In production, you'd upload to S3/Cloudinary and use that URL
+    console.log('⚠️ WhatsApp audio requires public URL hosting (skipping audio)');
+    return false;
+  } catch (error) {
+    console.error('❌ WhatsApp Audio Error:', error.message);
+    return false;
+  }
+}
 
 async function handleWebhook(req, res) {
   const { Body: incomingMsg, From: from, To: to, MediaUrl0: mediaUrl, MediaContentType0: mediaType } = req.body;
@@ -17,25 +33,77 @@ async function handleWebhook(req, res) {
       const transcribedText = await processAudioFromUrl(mediaUrl, Date.now().toString());
 
       if (transcribedText) {
-        // Send transcription
-        await client.messages.create({
-          body: `🎤 You said: "${transcribedText}"`,
-          from: to,
-          to: from,
-        });
+        // Check if it's a translation request
+        if (isTranslationRequest(transcribedText)) {
+          const targetLang = extractTargetLanguage(transcribedText) || 'English';
+          const textToTranslate = transcribedText.replace(/translate|translation|convert|say|speak|to \w+|in \w+/gi, '').trim();
+          console.log(`🌐 Translating to ${targetLang}: "${textToTranslate}"`);
 
-        // Generate and send AI response
-        const response = await generateResponse(transcribedText);
-        const chunks = splitMessage(response);
-
-        for (const chunk of chunks) {
+          // 1. Show what user said
           await client.messages.create({
-            body: chunk,
+            body: `🎤 You said: "${textToTranslate}"`,
             from: to,
             to: from,
           });
+
+          // 2. Get translation
+          const response = await translateText(textToTranslate, targetLang);
+          if (!response) {
+            await client.messages.create({
+              body: '❌ Translation failed.',
+              from: to,
+              to: from,
+            });
+            res.status(200).send('OK');
+            return;
+          }
+          const chunks = splitMessage(response);
+
+          for (const chunk of chunks) {
+            await client.messages.create({
+              body: chunk,
+              from: to,
+              to: from,
+            });
+          }
+
+          // Generate audio (cleanup only - WhatsApp needs file hosting for media)
+          const audioPath = `/tmp/tts_wa_${Date.now()}.mp3`;
+          const audioFile = await textToSpeech(response, audioPath);
+          if (audioFile) {
+            fs.unlink(audioFile, () => {});
+          }
+
+          console.log('✅ WhatsApp translation sent');
+        } else {
+          // Regular voice message - show transcription + response with context
+          await client.messages.create({
+            body: `🎤 You said: "${transcribedText}"`,
+            from: to,
+            to: from,
+          });
+
+          // Check for topic change and clear history if needed
+          handleTopicChange(from, transcribedText);
+
+          const history = getMessages(from);
+          const response = await generateResponse(transcribedText, history, from);
+
+          // Save to memory
+          addMessage(from, 'user', transcribedText);
+          addMessage(from, 'assistant', response);
+
+          const chunks = splitMessage(response);
+
+          for (const chunk of chunks) {
+            await client.messages.create({
+              body: chunk,
+              from: to,
+              to: from,
+            });
+          }
+          console.log('✅ WhatsApp voice response sent');
         }
-        console.log('✅ WhatsApp voice response sent');
       } else {
         await client.messages.create({
           body: '❌ Sorry, I couldn\'t understand the audio. Please try again.',
@@ -70,20 +138,70 @@ async function handleWebhook(req, res) {
     console.log(`💬 WhatsApp from ${from}: "${incomingMsg}"`);
   }
 
-  const response = await generateResponse(fullContext);
-  const chunks = splitMessage(response);
+  // Check if it's a translation request
+  if (isTranslationRequest(incomingMsg)) {
+    const targetLang = extractTargetLanguage(incomingMsg) || 'English';
+    const textToTranslate = incomingMsg.replace(/translate|translation|convert|say|speak|to \w+|in \w+/gi, '').trim();
+    console.log(`🌐 Translating to ${targetLang}: "${textToTranslate}"`);
 
-  try {
-    for (const chunk of chunks) {
+    const response = await translateText(textToTranslate, targetLang);
+    if (!response) {
       await client.messages.create({
-        body: chunk,
+        body: '❌ Translation failed.',
         from: to,
         to: from,
       });
+      res.status(200).send('OK');
+      return;
     }
-    console.log(`✅ WhatsApp response sent (${chunks.length} message${chunks.length > 1 ? 's' : ''})`);
-  } catch (error) {
-    console.error('❌ WhatsApp Error:', error.message);
+    const chunks = splitMessage(response);
+
+    try {
+      for (const chunk of chunks) {
+        await client.messages.create({
+          body: chunk,
+          from: to,
+          to: from,
+        });
+      }
+
+      // Generate audio (cleanup only - WhatsApp needs file hosting for media)
+      const audioPath = `/tmp/tts_wa_${Date.now()}.mp3`;
+      const audioFile = await textToSpeech(response, audioPath);
+      if (audioFile) {
+        fs.unlink(audioFile, () => {});
+      }
+
+      console.log('✅ WhatsApp translation sent');
+    } catch (error) {
+      console.error('❌ WhatsApp Error:', error.message);
+    }
+  } else {
+    // Check for topic change and clear history if needed
+    handleTopicChange(from, incomingMsg);
+
+    // Get conversation history and generate response with context
+    const history = getMessages(from);
+    const response = await generateResponse(fullContext, history, from);
+
+    // Save to memory
+    addMessage(from, 'user', fullContext);
+    addMessage(from, 'assistant', response);
+
+    const chunks = splitMessage(response);
+
+    try {
+      for (const chunk of chunks) {
+        await client.messages.create({
+          body: chunk,
+          from: to,
+          to: from,
+        });
+      }
+      console.log(`✅ WhatsApp response sent (${chunks.length} message${chunks.length > 1 ? 's' : ''})`);
+    } catch (error) {
+      console.error('❌ WhatsApp Error:', error.message);
+    }
   }
 
   res.status(200).send('OK');
