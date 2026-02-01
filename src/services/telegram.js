@@ -3,7 +3,8 @@ const fs = require('fs');
 const config = require('../config');
 const { generateResponse, translateText } = require('./ai');
 const { processAudioFromUrl, textToSpeech, isTranslationRequest, extractTargetLanguage } = require('./audio');
-const { addMessage, getMessages, handleTopicChange } = require('../utils/memory');
+const { addMessage, getMessages, handleTopicChange, detectTopic } = require('../utils/memory');
+const { saveChatMessage } = require('./chatHistory');
 
 let bot = null;
 
@@ -92,6 +93,7 @@ function init() {
               fs.unlink(audioFile, () => {});
             }
 
+            saveChatMessage(chatId, 'telegram', userName, textToTranslate, response, 'translation');
             console.log('✅ Translation with audio sent');
           } else {
             // Regular voice message - show transcription + response with context
@@ -109,6 +111,7 @@ function init() {
             addMessage(chatId, 'assistant', response);
 
             await sendLongMessage(chatId, response);
+            saveChatMessage(chatId, 'telegram', userName, transcribedText, response, detectTopic(transcribedText) || 'general');
             console.log('✅ Voice response sent');
           }
         } else {
@@ -139,6 +142,7 @@ function init() {
           await bot.sendChatAction(chatId, 'typing');
           const response = await generateResponse(transcribedText, [], chatId);
           await sendLongMessage(chatId, response);
+          saveChatMessage(chatId, 'telegram', userName, transcribedText, response, detectTopic(transcribedText) || 'general');
           console.log('✅ Audio response sent');
         } else {
           await bot.sendMessage(chatId, '❌ Sorry, I couldn\'t transcribe the audio.');
@@ -194,6 +198,7 @@ function init() {
         fs.unlink(audioFile, () => {});
       }
 
+      saveChatMessage(chatId, 'telegram', userName, messageText, response, 'translation');
       console.log('✅ Translation with audio sent');
     } else {
       // Check for topic change and clear history if needed
@@ -208,6 +213,7 @@ function init() {
       addMessage(chatId, 'assistant', response);
 
       await sendLongMessage(chatId, response);
+      saveChatMessage(chatId, 'telegram', userName, messageText, response, detectTopic(messageText) || 'general');
       console.log('✅ Telegram response sent');
     }
   });

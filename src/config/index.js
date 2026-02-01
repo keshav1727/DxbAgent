@@ -18,6 +18,9 @@ module.exports = {
   serpapi: {
     apiKey: process.env.SERPAPI_KEY,
   },
+  mongodb: {
+    uri: process.env.MONGODB_URI,
+  },
   server: {
     port: process.env.PORT || 3001,
   },

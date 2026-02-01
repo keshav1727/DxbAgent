@@ -4,7 +4,8 @@ const config = require('../config');
 const { generateResponse, translateText } = require('./ai');
 const { splitMessage } = require('../utils/helpers');
 const { processAudioFromUrl, textToSpeech, isTranslationRequest, extractTargetLanguage } = require('./audio');
-const { addMessage, getMessages, handleTopicChange } = require('../utils/memory');
+const { addMessage, getMessages, handleTopicChange, detectTopic } = require('../utils/memory');
+const { saveChatMessage } = require('./chatHistory');
 
 const client = twilio(config.twilio.accountSid, config.twilio.authToken);
 
@@ -74,6 +75,7 @@ async function handleWebhook(req, res) {
             fs.unlink(audioFile, () => {});
           }
 
+          saveChatMessage(from, 'whatsapp', from, textToTranslate, response, 'translation');
           console.log('✅ WhatsApp translation sent');
         } else {
           // Regular voice message - show transcription + response with context
@@ -102,6 +104,7 @@ async function handleWebhook(req, res) {
               to: from,
             });
           }
+          saveChatMessage(from, 'whatsapp', from, transcribedText, response, detectTopic(transcribedText) || 'general');
           console.log('✅ WhatsApp voice response sent');
         }
       } else {
@@ -172,6 +175,7 @@ async function handleWebhook(req, res) {
         fs.unlink(audioFile, () => {});
       }
 
+      saveChatMessage(from, 'whatsapp', from, incomingMsg, response, 'translation');
       console.log('✅ WhatsApp translation sent');
     } catch (error) {
       console.error('❌ WhatsApp Error:', error.message);
@@ -198,6 +202,7 @@ async function handleWebhook(req, res) {
           to: from,
         });
       }
+      saveChatMessage(from, 'whatsapp', from, incomingMsg, response, detectTopic(incomingMsg) || 'general');
       console.log(`✅ WhatsApp response sent (${chunks.length} message${chunks.length > 1 ? 's' : ''})`);
     } catch (error) {
       console.error('❌ WhatsApp Error:', error.message);

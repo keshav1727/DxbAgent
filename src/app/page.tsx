@@ -69,6 +69,15 @@ export default function Home() {
               </p>
             </div>
 
+            <div className="mt-4">
+              <a
+                href="/admin"
+                className="block w-full text-center px-4 py-3 bg-indigo-600 text-white font-medium rounded-md hover:bg-indigo-700 transition-colors"
+              >
+                View Admin Dashboard
+              </a>
+            </div>
+
             <div className="mt-4 p-4 bg-orange-50 dark:bg-orange-900/20 rounded-md">
               <h4 className="font-medium text-orange-800 dark:text-orange-300 mb-2">
                 📡 WhatsApp Setup

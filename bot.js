@@ -4,6 +4,7 @@ const telegram = require('./src/services/telegram');
 const whatsapp = require('./src/services/whatsapp');
 const googleflights = require('./src/services/googleflights');
 const googlehotels = require('./src/services/googlehotels');
+const { connectDB } = require('./src/services/chatHistory');
 
 console.log('🤖 Multi-Platform AI Agent starting...');
 
@@ -11,6 +12,9 @@ console.log('🤖 Multi-Platform AI Agent starting...');
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// Connect to MongoDB for chat history
+connectDB();
 
 // Initialize services
 telegram.init();
