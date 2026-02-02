@@ -15,6 +15,7 @@
     "@composio/vercel": "^0.5.5",
     "@tavily/core": "^0.7.1",
     "ai": "^6.0.56",
+    "amadeus": "^11.0.0",
     "axios": "^1.13.3",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",

@@ -1,6 +1,7 @@
+const Amadeus = require('amadeus');
 const config = require('../config');
 
-const SERPAPI_BASE = 'https://serpapi.com/search.json';
+let amadeus = null;
 
 // Currency detection map
 const CURRENCY_MAP = {
@@ -14,9 +15,53 @@ const CURRENCY_SYMBOLS = {
   'USD': '$', 'EUR': '€', 'GBP': '£', 'INR': '₹',
 };
 
-const GL_MAP = {
-  'USD': 'us', 'EUR': 'de', 'GBP': 'uk', 'INR': 'in',
+// City code mapping for Amadeus hotel search (IATA city codes)
+const CITY_CODES = {
+  // India
+  'delhi': 'DEL', 'new delhi': 'DEL', 'mumbai': 'BOM', 'bombay': 'BOM',
+  'bangalore': 'BLR', 'bengaluru': 'BLR', 'chennai': 'MAA', 'madras': 'MAA',
+  'hyderabad': 'HYD', 'kolkata': 'CCU', 'calcutta': 'CCU',
+  'pune': 'PNQ', 'ahmedabad': 'AMD', 'goa': 'GOI', 'jaipur': 'JAI',
+  'kochi': 'COK', 'cochin': 'COK', 'lucknow': 'LKO', 'varanasi': 'VNS',
+  'amritsar': 'ATQ', 'udaipur': 'UDR', 'jodhpur': 'JDH',
+  'shimla': 'SLV', 'manali': 'KUU', 'rishikesh': 'DED',
+  'agra': 'AGR', 'srinagar': 'SXR',
+
+  // Middle East
+  'dubai': 'DXB', 'abu dhabi': 'AUH', 'doha': 'DOH', 'riyadh': 'RUH',
+  'jeddah': 'JED', 'muscat': 'MCT', 'kuwait': 'KWI', 'bahrain': 'BAH',
+
+  // Asia
+  'singapore': 'SIN', 'bangkok': 'BKK', 'kuala lumpur': 'KUL',
+  'hong kong': 'HKG', 'tokyo': 'TYO', 'seoul': 'SEL',
+  'shanghai': 'SHA', 'beijing': 'BJS', 'jakarta': 'JKT',
+  'bali': 'DPS', 'denpasar': 'DPS', 'phuket': 'HKT',
+  'manila': 'MNL', 'kathmandu': 'KTM', 'colombo': 'CMB',
+  'dhaka': 'DAC', 'maldives': 'MLE', 'male': 'MLE',
+
+  // Europe
+  'london': 'LON', 'paris': 'PAR', 'frankfurt': 'FRA', 'amsterdam': 'AMS',
+  'rome': 'ROM', 'milan': 'MIL', 'zurich': 'ZRH', 'munich': 'MUC',
+  'madrid': 'MAD', 'barcelona': 'BCN', 'vienna': 'VIE', 'brussels': 'BRU',
+  'istanbul': 'IST', 'moscow': 'MOW', 'prague': 'PRG', 'lisbon': 'LIS',
+  'athens': 'ATH', 'dublin': 'DUB', 'edinburgh': 'EDI',
+
+  // Americas
+  'new york': 'NYC', 'los angeles': 'LAX', 'san francisco': 'SFO',
+  'chicago': 'CHI', 'miami': 'MIA', 'washington': 'WAS',
+  'boston': 'BOS', 'seattle': 'SEA', 'dallas': 'DFW',
+  'houston': 'IAH', 'atlanta': 'ATL', 'toronto': 'YTO',
+  'vancouver': 'YVR', 'sydney': 'SYD', 'melbourne': 'MEL',
+
+  // Africa
+  'johannesburg': 'JNB', 'cape town': 'CPT', 'nairobi': 'NBO',
+  'cairo': 'CAI', 'lagos': 'LOS', 'addis ababa': 'ADD', 'mauritius': 'MRU',
 };
+
+function getCityCode(location) {
+  const normalized = location.toLowerCase().trim();
+  return CITY_CODES[normalized] || normalized.toUpperCase().substring(0, 3);
+}
 
 // Parse hotel query to extract location, check-in, check-out, budget, star rating, and currency
 function parseHotelQuery(query) {
@@ -25,12 +70,10 @@ function parseHotelQuery(query) {
 
   // --- Extract currency ---
   let currency = 'INR'; // default
-  // Check for explicit currency symbols/words before a number (e.g., "$150", "€200", "£100")
   const currencySymbolMatch = lower.match(/([$€£₹])\s*\d/);
   if (currencySymbolMatch) {
     currency = CURRENCY_MAP[currencySymbolMatch[1]] || 'INR';
   } else {
-    // Check for currency words (e.g., "150 usd", "200 euros", "in gbp")
     for (const [key, val] of Object.entries(CURRENCY_MAP)) {
       if (key.length >= 3 && lower.includes(key)) {
         currency = val;
@@ -48,20 +91,18 @@ function parseHotelQuery(query) {
   }
   if (!starRating && lower.includes('luxury')) starRating = 5;
   if (!starRating && /\bbudget\b/.test(lower) && !lower.match(/budget\s*(?:₹|rs|inr|\$|€|£|\d)/i)) {
-    // "budget hotel" (not "budget 5000") → 2-3 star
-    starRating = 3; // use 3 as upper bound; we'll filter 2-3 client-side
+    starRating = 3;
   }
 
   // --- Extract budget/price range ---
   let maxPrice = null;
   let minPrice = null;
 
-  // Match patterns like "under 10k", "below 5000", "under ₹8000", "under $150"
   const underMatch = lower.match(/(?:under|below|less than|max|upto|up to)\s*(?:[$€£₹]|rs\.?|inr|usd|eur|gbp)?\s*(\d+)\s*(k)?/i);
   if (underMatch) {
     maxPrice = parseInt(underMatch[1]);
     if (underMatch[2]) maxPrice *= 1000;
-    if (currency === 'INR' && maxPrice < 500) maxPrice *= 1000; // "under 10" → "under 10k" only for INR
+    if (currency === 'INR' && maxPrice < 500) maxPrice *= 1000;
   }
 
   const rangeMatch = lower.match(/(\d+)\s*(k)?\s*(?:-|to)\s*(\d+)\s*(k)?/i);
@@ -92,10 +133,8 @@ function parseHotelQuery(query) {
     }
   }
 
-  // Check for "near airport" modifier
   const nearAirport = lower.includes('near airport') || lower.includes('airport area');
 
-  // Clean location
   if (location) {
     location = location.replace(/\b(hotel|hotels|in|at|near|around|the|for|of|under|below|budget|from|to|per|day|night|star|luxury|\d)\b/gi, '').trim();
     if (nearAirport) {
@@ -105,17 +144,16 @@ function parseHotelQuery(query) {
 
   // --- Extract dates ---
   let checkIn = new Date(today);
-  checkIn.setDate(today.getDate() + 1); // Default: tomorrow
+  checkIn.setDate(today.getDate() + 1);
 
   let checkOut = new Date(checkIn);
-  checkOut.setDate(checkIn.getDate() + 1); // Default: 1 night
+  checkOut.setDate(checkIn.getDate() + 1);
 
   const monthMap = {
     'jan': 0, 'feb': 1, 'mar': 2, 'apr': 3, 'may': 4, 'jun': 5,
     'jul': 6, 'aug': 7, 'sep': 8, 'oct': 9, 'nov': 10, 'dec': 11
   };
 
-  // Check for "from X to Y" date range
   const dateRangeMatch = lower.match(/(?:from\s+)?(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s*(\d{4}))?\s+(?:to|till|until|-)\s*(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s*(\d{4}))?/i);
 
   if (dateRangeMatch) {
@@ -131,7 +169,6 @@ function parseHotelQuery(query) {
     checkOut = new Date(outYear, outMonth, outDay);
     if (checkOut <= checkIn) checkOut.setFullYear(outYear + 1);
   } else {
-    // Single date
     const dateMatch = lower.match(/(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?:\s*(\d{4}))?/i);
     if (dateMatch) {
       const day = parseInt(dateMatch[1]);
@@ -144,7 +181,6 @@ function parseHotelQuery(query) {
     }
   }
 
-  // Relative dates
   if (lower.includes('today') || lower.includes('tonight')) {
     checkIn = new Date(today);
     checkOut = new Date(today);
@@ -156,14 +192,12 @@ function parseHotelQuery(query) {
     checkOut.setDate(checkIn.getDate() + 1);
   }
 
-  // Check for "X nights" or "X days"
   const nightsMatch = lower.match(/(\d+)\s*(?:night|nights|day|days)/i);
   if (nightsMatch && !dateRangeMatch) {
     checkOut = new Date(checkIn);
     checkOut.setDate(checkIn.getDate() + parseInt(nightsMatch[1]));
   }
 
-  // Format dates
   const formatDate = (d) => {
     const year = d.getFullYear();
     const month = String(d.getMonth() + 1).padStart(2, '0');
@@ -183,7 +217,7 @@ function parseHotelQuery(query) {
   };
 }
 
-// Check what info is missing from hotel query — location, dates, and budget are mandatory
+// Check what info is missing from hotel query
 function getMissingHotelInfo(query) {
   const lower = query.toLowerCase();
   const missing = [];
@@ -191,12 +225,10 @@ function getMissingHotelInfo(query) {
   const parsed = parseHotelQuery(query);
   if (!parsed.location) missing.push('location');
 
-  // Check dates - was a date explicitly mentioned?
   const hasDate = lower.match(/(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i) ||
     lower.includes('today') || lower.includes('tonight') || lower.includes('tomorrow');
   if (!hasDate) missing.push('dates');
 
-  // Check budget
   const hasBudget = lower.match(/(?:under|below|less than|max|upto|up to)\s*(?:[$€£₹]|rs\.?|inr|usd|eur|gbp)?\s*\d/i) ||
     lower.match(/\d+\s*k?\s*(?:-|to)\s*\d+/i);
   if (!hasBudget) missing.push('budget');
@@ -222,10 +254,10 @@ function buildHotelPrompt(missing) {
   return prompt;
 }
 
-// Search hotels using SerpApi Google Hotels
+// Search hotels using Amadeus: 2-step flow
 async function searchHotels(query, adults = 2) {
-  if (!config.serpapi?.apiKey) {
-    return { error: 'SerpApi not configured. Add SERPAPI_KEY to .env.local' };
+  if (!amadeus) {
+    return { error: 'Amadeus not configured. Add AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET to .env.local' };
   }
 
   const parsed = parseHotelQuery(query);
@@ -235,228 +267,161 @@ async function searchHotels(query, adults = 2) {
   }
 
   const sym = CURRENCY_SYMBOLS[parsed.currency] || parsed.currency;
+  const cityCode = getCityCode(parsed.location);
 
-  console.log(`🏨 Google Hotels: ${parsed.location} (${parsed.checkIn} to ${parsed.checkOut}) [${parsed.currency}]`);
+  console.log(`🏨 Amadeus Hotels: ${parsed.location} (${cityCode}) ${parsed.checkIn} to ${parsed.checkOut} [${parsed.currency}]`);
   if (parsed.maxPrice) {
     console.log(`   Budget: ${parsed.minPrice ? sym + parsed.minPrice + ' - ' : 'Under '}${sym}${parsed.maxPrice}`);
   }
-  if (parsed.starRating) {
-    console.log(`   Star filter: ${parsed.starRating}-star`);
-  }
 
   try {
-    const baseParams = {
-      engine: 'google_hotels',
-      q: parsed.location + ' hotels',
-      check_in_date: parsed.checkIn,
-      check_out_date: parsed.checkOut,
-      currency: parsed.currency,
-      hl: 'en',
-      gl: GL_MAP[parsed.currency] || 'us',
-      adults: adults.toString(),
-      api_key: config.serpapi.apiKey,
-    };
-
-    // Use hotel_class filter when star rating is specified
+    // Step 1: Get hotel IDs by city
+    console.log(`🏨 Step 1: Fetching hotel list for city ${cityCode}...`);
+    const hotelListParams = { cityCode };
     if (parsed.starRating) {
-      baseParams.hotel_class = parsed.starRating.toString();
+      hotelListParams.ratings = [parsed.starRating].join(',');
     }
 
-    // Use price filters only when budget is given
-    if (parsed.minPrice) {
-      baseParams.min_price = parsed.minPrice;
-    }
-    if (parsed.maxPrice) {
-      baseParams.max_price = parsed.maxPrice;
-    }
+    const hotelListResponse = await amadeus.referenceData.locations.hotels.byCity.get(hotelListParams);
+    let hotelList = hotelListResponse.data || [];
 
-    // Sort by lowest price only when budget is specified
-    if (parsed.maxPrice || parsed.minPrice) {
-      baseParams.sort_by = '3'; // lowest price
-    }
-
-    // Fetch first page
-    const params = new URLSearchParams(baseParams);
-    console.log(`🏨 API params: currency=${parsed.currency}, hotel_class=${parsed.starRating || 'any'}, min_price=${parsed.minPrice || 'none'}, max_price=${parsed.maxPrice || 'none'}`);
-    const response = await fetch(`${SERPAPI_BASE}?${params}`);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('SerpApi Hotels Error:', response.status, errorText);
-      return { error: `Google Hotels API error: ${response.status}` };
-    }
-
-    const data = await response.json();
-
-    if (data.error) {
-      return { error: data.error };
-    }
-
-    let properties = data.properties || [];
-
-    // Fetch additional pages (cap at 5 pages to stay responsive)
-    const MAX_PAGES = 5;
-    let nextPageToken = data.serpapi_pagination?.next_page_token;
-    let pagesLoaded = 1;
-
-    while (nextPageToken && pagesLoaded < MAX_PAGES) {
-      console.log(`🏨 Fetching page ${pagesLoaded + 1}/${MAX_PAGES}...`);
-      const nextParams = new URLSearchParams({
-        ...baseParams,
-        next_page_token: nextPageToken,
-      });
-
-      const nextResponse = await fetch(`${SERPAPI_BASE}?${nextParams}`);
-      if (nextResponse.ok) {
-        const nextData = await nextResponse.json();
-        if (nextData.properties?.length > 0) {
-          properties = [...properties, ...nextData.properties];
-        }
-        nextPageToken = nextData.serpapi_pagination?.next_page_token;
-      } else {
-        break;
-      }
-      pagesLoaded++;
-    }
-
-    console.log(`🏨 Total hotels fetched: ${properties.length} (${pagesLoaded} pages)`);
-
-    if (properties.length === 0) {
+    if (hotelList.length === 0) {
       return { error: `No hotels found in ${parsed.location}` };
     }
 
-    // Client-side star filter as safety net
-    if (parsed.starRating) {
-      properties = properties.filter(hotel => {
-        const hotelStars = hotel.extracted_hotel_class || 0;
-        if (hotelStars === 0) return true; // keep hotels without star info
-        // For "budget" keyword (starRating=3), allow 2-3 star
-        if (parsed.starRating === 3 && query.toLowerCase().includes('budget')) {
-          return hotelStars >= 2 && hotelStars <= 3;
-        }
-        return hotelStars === parsed.starRating;
-      });
-      console.log(`🏨 Hotels after star filter: ${properties.length}`);
+    console.log(`🏨 Found ${hotelList.length} hotels in ${cityCode}`);
+
+    // Limit to first 40 hotels (we'll batch in groups of 20)
+    hotelList = hotelList.slice(0, 40);
+
+    // Step 2: Get offers for hotels in batches
+    const BATCH_SIZE = 20;
+    const batches = [];
+    for (let i = 0; i < hotelList.length; i += BATCH_SIZE) {
+      batches.push(hotelList.slice(i, i + BATCH_SIZE));
     }
 
-    // Client-side price filter as safety net
+    console.log(`🏨 Step 2: Fetching offers in ${batches.length} batches...`);
+
+    let allOffers = [];
+
+    for (let b = 0; b < batches.length; b++) {
+      const batch = batches[b];
+      const hotelIds = batch.map(h => h.hotelId).join(',');
+
+      console.log(`🏨 Batch ${b + 1}/${batches.length} (${batch.length} hotels)...`);
+
+      try {
+        const offersResponse = await amadeus.shopping.hotelOffersSearch.get({
+          hotelIds: hotelIds,
+          checkInDate: parsed.checkIn,
+          checkOutDate: parsed.checkOut,
+          adults: adults,
+          currency: parsed.currency,
+        });
+
+        const offers = offersResponse.data || [];
+        allOffers = [...allOffers, ...offers];
+      } catch (batchError) {
+        // Log but continue with other batches
+        console.log(`🏨 Batch ${b + 1} error: ${batchError.description?.[0]?.detail || batchError.message || 'unknown'}`);
+      }
+    }
+
+    console.log(`🏨 Total hotel offers: ${allOffers.length}`);
+
+    if (allOffers.length === 0) {
+      return { error: `No available hotels found in ${parsed.location} for ${parsed.checkIn} to ${parsed.checkOut}` };
+    }
+
+    // Filter by price if budget specified
     if (parsed.maxPrice || parsed.minPrice) {
-      properties = properties.filter(hotel => {
-        const price = hotel.rate_per_night?.extracted_lowest || hotel.rate_per_night?.lowest || 0;
-        if (price === 0) return true; // Keep hotels without price info
-        if (parsed.maxPrice && price > parsed.maxPrice) return false;
-        if (parsed.minPrice && price < parsed.minPrice) return false;
+      allOffers = allOffers.filter(hotel => {
+        const offer = hotel.offers?.[0];
+        if (!offer) return false;
+        const price = parseFloat(offer.price?.total || 0);
+        // Price from Amadeus is total for the stay, calculate per-night
+        const nights = Math.max(1, Math.round((new Date(parsed.checkOut) - new Date(parsed.checkIn)) / 86400000));
+        const perNight = price / nights;
+        if (parsed.maxPrice && perNight > parsed.maxPrice) return false;
+        if (parsed.minPrice && perNight < parsed.minPrice) return false;
         return true;
       });
-      console.log(`🏨 Hotels in budget: ${properties.length}`);
+      console.log(`🏨 Hotels in budget: ${allOffers.length}`);
     }
 
-    if (properties.length === 0) {
+    if (allOffers.length === 0) {
       let filterDesc = '';
       if (parsed.starRating) filterDesc += `${parsed.starRating}-star `;
-      if (parsed.maxPrice) filterDesc += `under ${sym}${parsed.maxPrice} `;
+      if (parsed.maxPrice) filterDesc += `under ${sym}${parsed.maxPrice}/night `;
       return { error: `No ${filterDesc}hotels found in ${parsed.location}` };
     }
 
-    // Fetch property details for ALL hotels in batches of 15
-    const BATCH_SIZE = 15;
-    const totalBatches = Math.ceil(properties.length / BATCH_SIZE);
-    console.log(`🏨 Fetching booking prices for ALL ${properties.length} hotels in ${totalBatches} batches...`);
-
-    const detailMap = new Map();
-
-    for (let b = 0; b < totalBatches; b++) {
-      const start = b * BATCH_SIZE;
-      const end = Math.min(start + BATCH_SIZE, properties.length);
-      const batch = properties.slice(start, end);
-      console.log(`🏨 Batch ${b + 1}/${totalBatches} (${batch.length} hotels)...`);
-
-      const detailPromises = batch.map(async (hotel) => {
-        if (!hotel.property_token) return null;
-        try {
-          const detailParams = new URLSearchParams({
-            engine: 'google_hotels',
-            q: parsed.location + ' hotels',
-            check_in_date: parsed.checkIn,
-            check_out_date: parsed.checkOut,
-            currency: parsed.currency,
-            hl: 'en',
-            gl: GL_MAP[parsed.currency] || 'us',
-            adults: adults.toString(),
-            property_token: hotel.property_token,
-            api_key: config.serpapi.apiKey,
-          });
-          const res = await fetch(`${SERPAPI_BASE}?${detailParams}`);
-          if (res.ok) {
-            const detail = await res.json();
-            return { token: hotel.property_token, prices: detail.prices || [] };
-          }
-        } catch (e) {
-          // Ignore individual failures
-        }
-        return null;
-      });
-
-      const batchResults = await Promise.all(detailPromises);
-      batchResults.forEach(d => {
-        if (d && d.prices.length > 0) {
-          detailMap.set(d.token, d.prices);
-        }
-      });
-    }
-
-    console.log(`🏨 Got booking prices for ${detailMap.size}/${properties.length} hotels`);
+    // Calculate number of nights
+    const nights = Math.max(1, Math.round((new Date(parsed.checkOut) - new Date(parsed.checkIn)) / 86400000));
 
     // Process hotel data
-    const hotels = properties.map((hotel, index) => {
-      const pricePerNight = hotel.rate_per_night?.extracted_lowest || 0;
-      const priceBeforeTax = hotel.rate_per_night?.extracted_before_taxes_fees || 0;
-      const totalPrice = hotel.total_rate?.extracted_lowest || 0;
-      const totalBeforeTax = hotel.total_rate?.extracted_before_taxes_fees || 0;
+    const hotels = allOffers.map((hotel, index) => {
+      const offer = hotel.offers?.[0] || {};
+      const totalPrice = parseFloat(offer.price?.total || 0);
+      const perNight = Math.round(totalPrice / nights);
+      const currencyCode = offer.price?.currency || parsed.currency;
 
-      // Get booking source prices and links from property details
-      const bookingSources = [];
-      const detailPrices = detailMap.get(hotel.property_token);
-      if (detailPrices) {
-        detailPrices.forEach(p => {
-          if (p.rate_per_night?.extracted_lowest || p.extracted_price) {
-            bookingSources.push({
-              source: p.source || 'Unknown',
-              perNight: p.rate_per_night?.extracted_lowest || p.extracted_price || 0,
-              total: p.total_rate?.extracted_lowest || 0,
-              link: p.link || null,
-            });
-          }
-        });
-        // Sort by price so cheapest is first
-        bookingSources.sort((a, b) => a.perNight - b.perNight);
+      // Room info
+      const room = offer.room || {};
+      const roomType = room.typeEstimated?.category || room.description?.text || 'Standard Room';
+      const bedType = room.typeEstimated?.bedType || null;
+      const beds = room.typeEstimated?.beds || null;
+
+      // Rating from hotel list lookup
+      const hotelInfo = hotelList.find(h => h.hotelId === hotel.hotel?.hotelId);
+      const rating = hotel.hotel?.rating || hotelInfo?.rating || null;
+
+      // Cancellation policy
+      const cancellation = offer.policies?.cancellations?.[0];
+      let cancellationPolicy = null;
+      if (cancellation) {
+        if (cancellation.type === 'FULL_STAY') {
+          cancellationPolicy = 'Non-refundable';
+        } else if (cancellation.deadline) {
+          cancellationPolicy = `Free cancellation before ${new Date(cancellation.deadline).toLocaleDateString('en-IN')}`;
+        }
       }
 
       return {
         rank: index + 1,
-        name: hotel.name || 'Unknown Hotel',
-        type: hotel.type || 'Hotel',
-        stars: hotel.hotel_class || null,
-        starsNum: hotel.extracted_hotel_class || null,
-        rating: hotel.overall_rating || null,
-        reviews: hotel.reviews || null,
-        location: hotel.location || hotel.neighborhood || null,
-        description: hotel.description || null,
-        checkInTime: hotel.check_in_time || null,
-        checkOutTime: hotel.check_out_time || null,
+        name: hotel.hotel?.name || 'Unknown Hotel',
+        type: 'Hotel',
+        stars: rating ? `${'⭐'.repeat(parseInt(rating))}` : null,
+        starsNum: rating ? parseInt(rating) : null,
+        rating: rating ? parseFloat(rating) : null,
+        reviews: null,
+        location: hotel.hotel?.cityCode || parsed.location,
+        description: null,
+        checkInTime: offer.checkInDate || null,
+        checkOutTime: offer.checkOutDate || null,
         price: {
-          perNight: pricePerNight,
-          perNightBeforeTax: priceBeforeTax,
+          perNight: perNight,
+          perNightBeforeTax: 0,
           total: totalPrice,
-          totalBeforeTax: totalBeforeTax,
-          currency: parsed.currency,
+          totalBeforeTax: parseFloat(offer.price?.base || 0),
+          currency: currencyCode,
         },
-        bookingSources,
-        amenities: hotel.amenities || [],
-        nearbyPlaces: hotel.nearby_places || [],
-        link: hotel.link || null,
+        bookingSources: [],
+        amenities: [],
+        nearbyPlaces: [],
+        roomType: roomType,
+        bedType: bedType ? `${beds || ''} ${bedType}`.trim() : null,
+        cancellationPolicy: cancellationPolicy,
+        link: null,
       };
     });
+
+    // Sort by price per night
+    hotels.sort((a, b) => a.price.perNight - b.price.perNight);
+
+    // Re-rank after sorting
+    hotels.forEach((h, i) => { h.rank = i + 1; });
 
     return {
       success: true,
@@ -474,30 +439,12 @@ async function searchHotels(query, adults = 2) {
     };
 
   } catch (error) {
-    console.error('❌ SerpApi Hotels Error:', error.message);
-    return { error: `Hotel search failed: ${error.message}` };
+    console.error('❌ Amadeus Hotels Error:', error.description || error.message);
+    return { error: `Hotel search failed: ${error.description?.[0]?.detail || error.message}` };
   }
 }
 
-// Priority booking sources to show
-const PRIORITY_SOURCES = ['booking.com', 'makemytrip', 'goibibo', 'agoda', 'cleartrip.com', 'easemytrip.com', 'trip.com', 'expedia.com', 'trivago.com', 'hotels.com'];
-
-function getTopBookingSources(bookingSources, limit = 5) {
-  if (!bookingSources || bookingSources.length === 0) return [];
-
-  const sorted = [...bookingSources].sort((a, b) => {
-    const aIdx = PRIORITY_SOURCES.findIndex(s => a.source.toLowerCase().includes(s));
-    const bIdx = PRIORITY_SOURCES.findIndex(s => b.source.toLowerCase().includes(s));
-    if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
-    if (aIdx !== -1) return -1;
-    if (bIdx !== -1) return 1;
-    return a.perNight - b.perNight;
-  });
-
-  return sorted.slice(0, limit);
-}
-
-// Format a single hotel in detailed view (with currency symbol)
+// Format a single hotel in detailed view
 function formatHotelDetailed(h, sym) {
   const fmtPrice = (val) => {
     if (sym === '₹') return `${sym}${val.toLocaleString('en-IN')}`;
@@ -510,9 +457,7 @@ function formatHotelDetailed(h, sym) {
   output += `\n`;
 
   if (h.rating) {
-    output += `⭐ ${h.rating}/5`;
-    if (h.reviews) output += ` (${h.reviews} reviews)`;
-    output += `\n`;
+    output += `⭐ ${h.rating}/5\n`;
   }
 
   if (h.location) {
@@ -521,54 +466,32 @@ function formatHotelDetailed(h, sym) {
 
   // Price details
   if (h.price.perNight > 0) {
-    output += `💰 **${fmtPrice(h.price.perNight)}**/night (lowest)`;
-    if (h.price.perNightBeforeTax > 0 && h.price.perNightBeforeTax !== h.price.perNight) {
-      output += ` (${fmtPrice(h.price.perNightBeforeTax)} + taxes)`;
+    output += `💰 **${fmtPrice(h.price.perNight)}**/night`;
+    if (h.price.total > 0) {
+      output += ` (Total: ${fmtPrice(h.price.total)})`;
     }
     output += `\n`;
   } else {
     output += `💰 Price not available\n`;
   }
 
-  // Show booking source price comparison (sorted cheapest first)
-  if (h.bookingSources && h.bookingSources.length > 0) {
-    const cheapestPrice = h.bookingSources[0].perNight;
-    output += `🔗 **Price comparison:**\n`;
-    h.bookingSources.forEach((s, i) => {
-      const tag = s.perNight === cheapestPrice ? ' ✅ CHEAPEST' : '';
-      const link = s.link ? ` [Book](${s.link})` : '';
-      output += `   ${s.source}: ${fmtPrice(s.perNight)}/night${tag}${link}\n`;
-    });
+  // Room info
+  if (h.roomType) {
+    output += `🛏️ Room: ${h.roomType}`;
+    if (h.bedType) output += ` — ${h.bedType}`;
+    output += `\n`;
   }
 
-  // Check-in/out times
-  if (h.checkInTime || h.checkOutTime) {
-    output += `🕐 Check-in: ${h.checkInTime || 'N/A'} | Check-out: ${h.checkOutTime || 'N/A'}\n`;
-  }
-
-  // Amenities
-  if (h.amenities && h.amenities.length > 0) {
-    output += `🏷️ ${h.amenities.slice(0, 8).join(' • ')}\n`;
-  }
-
-  // Nearby places
-  if (h.nearbyPlaces && h.nearbyPlaces.length > 0) {
-    const places = h.nearbyPlaces.slice(0, 3).map(p => {
-      const transport = p.transportations?.[0];
-      return `${p.name}${transport ? ' (' + transport.duration + ')' : ''}`;
-    });
-    output += `📍 Nearby: ${places.join(' • ')}\n`;
-  }
-
-  if (h.description) {
-    output += `📝 ${h.description.substring(0, 120)}${h.description.length > 120 ? '...' : ''}\n`;
+  // Cancellation policy
+  if (h.cancellationPolicy) {
+    output += `📋 ${h.cancellationPolicy}\n`;
   }
 
   output += `\n`;
   return output;
 }
 
-// Format a single hotel in compact view (one line) — shows cheapest booking source
+// Format a single hotel in compact view
 function formatHotelCompact(h, sym) {
   const fmtPrice = (val) => {
     if (sym === '₹') return `${sym}${val.toLocaleString('en-IN')}`;
@@ -576,20 +499,14 @@ function formatHotelCompact(h, sym) {
   };
 
   let price = 'N/A';
-  let bookLink = '';
-  // Prefer cheapest booking source price (already sorted cheapest first)
-  if (h.bookingSources && h.bookingSources.length > 0) {
-    const cheapest = h.bookingSources[0];
-    price = `${fmtPrice(cheapest.perNight)} via ${cheapest.source}`;
-    if (cheapest.link) bookLink = ` [Book](${cheapest.link})`;
-  } else if (h.price.perNight > 0) {
+  if (h.price.perNight > 0) {
     price = fmtPrice(h.price.perNight);
   }
 
   const rating = h.rating ? `⭐${h.rating}` : '';
   const stars = h.starsNum ? `${h.starsNum}-star` : '';
   const info = [stars, rating].filter(Boolean).join(' ');
-  return `${h.rank}. **${h.name}** — ${price}/night ${info}${bookLink}\n`;
+  return `${h.rank}. **${h.name}** — ${price}/night ${info}\n`;
 }
 
 // Format results for display
@@ -614,7 +531,7 @@ function formatHotelResults(results) {
   if (search.maxPrice) {
     output += `💰 Budget: ${search.minPrice ? fmtPrice(search.minPrice) + ' - ' : 'Under '}${fmtPrice(search.maxPrice)}\n`;
   }
-  output += `🔍 **${totalFound} hotels found** (Google Hotels)\n\n`;
+  output += `🔍 **${totalFound} hotels found** (Amadeus)\n\n`;
 
   // Show first 15 in detailed format
   const detailedCount = Math.min(15, hotels.length);
@@ -638,15 +555,11 @@ function formatHotelResults(results) {
     const sorted = [...hotelsWithPrice].sort((a, b) => a.price.perNight - b.price.perNight);
     const cheapest = sorted[0];
     const mostExpensive = sorted[sorted.length - 1];
-    const bestRated = hotels.filter(h => h.rating).reduce((max, h) => (h.rating || 0) > (max.rating || 0) ? h : max, hotels[0]);
 
     output += `📊 **Summary:**\n`;
     output += `• Total: ${totalFound} hotels\n`;
     output += `• Price range: ${fmtPrice(cheapest.price.perNight)} — ${fmtPrice(mostExpensive.price.perNight)}/night\n`;
     output += `• 💰 Cheapest: ${cheapest.name} at ${fmtPrice(cheapest.price.perNight)}/night\n`;
-    if (bestRated && bestRated.rating) {
-      output += `• ⭐ Best Rated: ${bestRated.name} (${bestRated.rating}/5)\n`;
-    }
   }
 
   output += `\n🔗 **Book on:**\n`;
@@ -657,10 +570,15 @@ function formatHotelResults(results) {
 }
 
 function init() {
-  if (config.serpapi?.apiKey) {
-    console.log('🏨 SerpApi: Google Hotels enabled');
+  if (config.amadeus?.clientId && config.amadeus?.clientSecret) {
+    amadeus = new Amadeus({
+      clientId: config.amadeus.clientId,
+      clientSecret: config.amadeus.clientSecret,
+    });
+    console.log('🏨 Amadeus: Hotel search enabled');
     return true;
   }
+  console.log('⚠️ Amadeus: Hotel search not configured');
   return false;
 }
 

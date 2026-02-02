@@ -15,8 +15,9 @@ module.exports = {
   tavily: {
     apiKey: process.env.TAVILY_API_KEY,
   },
-  serpapi: {
-    apiKey: process.env.SERPAPI_KEY,
+  amadeus: {
+    clientId: process.env.AMADEUS_CLIENT_ID,
+    clientSecret: process.env.AMADEUS_CLIENT_SECRET,
   },
   mongodb: {
     uri: process.env.MONGODB_URI,

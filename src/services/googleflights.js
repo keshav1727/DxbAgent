@@ -1,6 +1,34 @@
+const Amadeus = require('amadeus');
 const config = require('../config');
 
-const SERPAPI_BASE = 'https://serpapi.com/search.json';
+let amadeus = null;
+
+// Airline name lookup from IATA carrier codes
+const AIRLINE_NAMES = {
+  '6E': 'IndiGo', 'AI': 'Air India', 'UK': 'Vistara', 'SG': 'SpiceJet',
+  'G8': 'Go First', 'I5': 'AirAsia India', 'QP': 'Akasa Air',
+  'EK': 'Emirates', 'EY': 'Etihad Airways', 'QR': 'Qatar Airways',
+  'SV': 'Saudia', 'WY': 'Oman Air', 'GF': 'Gulf Air', 'KU': 'Kuwait Airways',
+  'FZ': 'flydubai', 'G9': 'Air Arabia', 'WS': 'WestJet',
+  'SQ': 'Singapore Airlines', 'TG': 'Thai Airways', 'MH': 'Malaysia Airlines',
+  'CX': 'Cathay Pacific', 'NH': 'ANA', 'JL': 'Japan Airlines',
+  'KE': 'Korean Air', 'OZ': 'Asiana Airlines', 'GA': 'Garuda Indonesia',
+  'PR': 'Philippine Airlines', 'UL': 'SriLankan Airlines', 'BG': 'Biman Bangladesh',
+  'BA': 'British Airways', 'LH': 'Lufthansa', 'AF': 'Air France',
+  'KL': 'KLM', 'AZ': 'ITA Airways', 'IB': 'Iberia', 'LX': 'Swiss',
+  'OS': 'Austrian Airlines', 'SN': 'Brussels Airlines', 'TK': 'Turkish Airlines',
+  'SU': 'Aeroflot', 'LO': 'LOT Polish', 'SK': 'SAS',
+  'AA': 'American Airlines', 'UA': 'United Airlines', 'DL': 'Delta Air Lines',
+  'WN': 'Southwest Airlines', 'B6': 'JetBlue', 'AS': 'Alaska Airlines',
+  'AC': 'Air Canada', 'QF': 'Qantas', 'VA': 'Virgin Australia',
+  'SA': 'South African Airways', 'ET': 'Ethiopian Airlines', 'KQ': 'Kenya Airways',
+  'MS': 'EgyptAir', 'W3': 'Arik Air', 'MK': 'Air Mauritius',
+  '9W': 'Jet Airways', 'IX': 'Air India Express', 'S5': 'Star Air',
+};
+
+function getAirlineName(carrierCode) {
+  return AIRLINE_NAMES[carrierCode] || carrierCode;
+}
 
 // Airport codes mapping
 const airportCodes = {
@@ -181,34 +209,27 @@ function parseFlightQuery(query) {
   };
 }
 
-// Fetch flights for a specific travel class
-async function fetchFlightsByClass(parsed, adults, travelClass) {
-  const params = new URLSearchParams({
-    engine: 'google_flights',
-    departure_id: parsed.origin,
-    arrival_id: parsed.destination,
-    outbound_date: parsed.departureDate,
-    currency: 'INR',
-    hl: 'en',
-    adults: adults.toString(),
-    type: '2', // One-way
-    travel_class: travelClass.toString(), // 1=Economy, 2=Premium Economy, 3=Business, 4=First
-    api_key: config.serpapi.apiKey,
-  });
-
-  const response = await fetch(`${SERPAPI_BASE}?${params}`);
-  if (!response.ok) return null;
-
-  const data = await response.json();
-  if (data.error) return null;
-
-  return data;
+// Parse ISO 8601 duration (e.g., "PT2H30M") to minutes
+function parseISO8601Duration(duration) {
+  if (!duration) return 0;
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?/);
+  if (!match) return 0;
+  const hours = parseInt(match[1] || 0);
+  const mins = parseInt(match[2] || 0);
+  return hours * 60 + mins;
 }
 
-// Search flights using SerpApi Google Flights
+// Format minutes to "Xh Ym"
+function formatDuration(totalMinutes) {
+  const hours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+  return `${hours}h ${mins}m`;
+}
+
+// Search flights using Amadeus Flight Offers Search
 async function searchFlights(query, adults = 1) {
-  if (!config.serpapi?.apiKey) {
-    return { error: 'SerpApi not configured. Add SERPAPI_KEY to .env.local' };
+  if (!amadeus) {
+    return { error: 'Amadeus not configured. Add AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET to .env.local' };
   }
 
   const parsed = parseFlightQuery(query);
@@ -217,96 +238,101 @@ async function searchFlights(query, adults = 1) {
     return { error: 'Could not parse origin and destination. Use format: "flights from [city] to [city]"' };
   }
 
-  console.log(`✈️ Google Flights: ${parsed.origin} → ${parsed.destination} on ${parsed.departureDate}`);
+  console.log(`\u2708\uFE0F Amadeus Flights: ${parsed.origin} \u2192 ${parsed.destination} on ${parsed.departureDate}`);
 
   try {
-    // Fetch Economy and Premium Economy in parallel
-    const [economyData, premiumData] = await Promise.all([
-      fetchFlightsByClass(parsed, adults, 1),  // Economy
-      fetchFlightsByClass(parsed, adults, 2),  // Premium Economy
-    ]);
+    const response = await amadeus.shopping.flightOffersSearch.get({
+      originLocationCode: parsed.origin,
+      destinationLocationCode: parsed.destination,
+      departureDate: parsed.departureDate,
+      adults: adults,
+      currencyCode: 'INR',
+      nonStop: false,
+      max: 15,
+    });
 
-    if (!economyData) {
+    const offers = response.data || [];
+
+    if (offers.length === 0) {
       return { error: `No flights found from ${parsed.origin} to ${parsed.destination} on ${parsed.departureDate}` };
     }
 
-    // Build premium economy price map (by flight number)
-    const premiumPrices = {};
-    if (premiumData) {
-      const premiumFlights = [...(premiumData.best_flights || []), ...(premiumData.other_flights || [])];
-      premiumFlights.forEach(flight => {
-        const legs = flight.flights || [];
-        const firstLeg = legs[0] || {};
-        const key = `${firstLeg.airline}-${firstLeg.flight_number}-${firstLeg.departure_airport?.time}`;
-        premiumPrices[key] = flight.price || null;
-      });
-    }
+    // Extract carrier names from dictionaries
+    const carrierDict = response.result?.dictionaries?.carriers || {};
 
-    // Get best flights and other flights from economy
-    const bestFlights = economyData.best_flights || [];
-    const otherFlights = economyData.other_flights || [];
-    const allFlights = [...bestFlights, ...otherFlights].slice(0, 15);
+    const flights = offers.map((offer, index) => {
+      const itinerary = offer.itineraries[0]; // One-way: first itinerary
+      const segments = itinerary.segments || [];
+      const firstSeg = segments[0] || {};
+      const lastSeg = segments[segments.length - 1] || firstSeg;
 
-    if (allFlights.length === 0) {
-      return { error: `No flights found from ${parsed.origin} to ${parsed.destination} on ${parsed.departureDate}` };
-    }
-
-    const flights = allFlights.map((flight, index) => {
-      const legs = flight.flights || [];
-      const firstLeg = legs[0] || {};
-      const lastLeg = legs[legs.length - 1] || firstLeg;
-
-      // Key for matching premium price
-      const priceKey = `${firstLeg.airline}-${firstLeg.flight_number}-${firstLeg.departure_airport?.time}`;
-      const premiumEconomyPrice = premiumPrices[priceKey] || null;
-
-      // Calculate total duration
-      const totalDuration = flight.total_duration || 0;
-      const hours = Math.floor(totalDuration / 60);
-      const mins = totalDuration % 60;
-      const duration = `${hours}h ${mins}m`;
+      // Total duration from itinerary
+      const totalMinutes = parseISO8601Duration(itinerary.duration);
 
       // Stops
-      const stops = legs.length - 1;
-      const stopAirports = legs.slice(0, -1).map(l => l.arrival_airport?.id || '').filter(Boolean);
+      const stops = segments.length - 1;
+      const stopAirports = segments.slice(0, -1).map(s => s.arrival.iataCode);
 
-      // Get layover info
-      const layovers = flight.layovers || [];
-      const layoverInfo = layovers.map(l => `${l.name} (${Math.floor(l.duration / 60)}h ${l.duration % 60}m)`);
+      // Layover durations between segments
+      const layoverInfo = [];
+      for (let i = 0; i < segments.length - 1; i++) {
+        const arrivalTime = new Date(segments[i].arrival.at);
+        const departureTime = new Date(segments[i + 1].departure.at);
+        const layoverMins = Math.round((departureTime - arrivalTime) / 60000);
+        layoverInfo.push(`${segments[i].arrival.iataCode} (${formatDuration(layoverMins)})`);
+      }
+
+      // Carrier name
+      const carrierCode = firstSeg.carrierCode || '';
+      const airlineName = carrierDict[carrierCode] || getAirlineName(carrierCode);
+
+      // Price
+      const price = parseFloat(offer.price?.grandTotal || offer.price?.total || 0);
+
+      // Departure and arrival times
+      const depTime = firstSeg.departure?.at || '';
+      const arrTime = lastSeg.arrival?.at || '';
+
+      // Aircraft type
+      const aircraft = firstSeg.aircraft?.code || 'N/A';
+
+      // Cabin class from traveler pricing
+      const travelerPricing = offer.travelerPricings?.[0];
+      const cabin = travelerPricing?.fareDetailsBySegment?.[0]?.cabin || 'ECONOMY';
+      const travelClass = cabin.charAt(0) + cabin.slice(1).toLowerCase();
 
       return {
         rank: index + 1,
-        airline: firstLeg.airline || 'Unknown',
-        airlineLogo: firstLeg.airline_logo || null,
-        flightNumber: firstLeg.flight_number || 'N/A',
+        airline: airlineName,
+        airlineLogo: null,
+        flightNumber: `${carrierCode}${firstSeg.number || ''}`,
         departure: {
-          airport: firstLeg.departure_airport?.id || parsed.origin,
-          airportName: firstLeg.departure_airport?.name || '',
-          time: firstLeg.departure_airport?.time || 'N/A',
+          airport: firstSeg.departure?.iataCode || parsed.origin,
+          airportName: firstSeg.departure?.iataCode || '',
+          time: depTime ? new Date(depTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }) : 'N/A',
           date: parsed.departureDate,
         },
         arrival: {
-          airport: lastLeg.arrival_airport?.id || parsed.destination,
-          airportName: lastLeg.arrival_airport?.name || '',
-          time: lastLeg.arrival_airport?.time || 'N/A',
+          airport: lastSeg.arrival?.iataCode || parsed.destination,
+          airportName: lastSeg.arrival?.iataCode || '',
+          time: arrTime ? new Date(arrTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true }) : 'N/A',
           date: parsed.departureDate,
         },
-        duration: duration,
+        duration: formatDuration(totalMinutes),
         stops: stops,
         stopDetails: stopAirports,
         layoverInfo: layoverInfo,
-        airplane: firstLeg.airplane || 'N/A',
-        travelClass: firstLeg.travel_class || 'Economy',
-        legroom: firstLeg.legroom || 'N/A',
-        extensions: firstLeg.extensions || [],
+        airplane: aircraft,
+        travelClass: travelClass,
+        legroom: 'N/A',
+        extensions: [],
         price: {
-          economy: flight.price || 0,
-          premiumEconomy: premiumEconomyPrice,
+          economy: price,
+          premiumEconomy: null,
           currency: 'INR',
         },
-        bookingToken: flight.booking_token || null,
-        carbonEmissions: flight.carbon_emissions?.this_flight ?
-          `${Math.round(flight.carbon_emissions.this_flight / 1000)} kg CO2` : null,
+        bookingToken: null,
+        carbonEmissions: null,
       };
     });
 
@@ -316,77 +342,62 @@ async function searchFlights(query, adults = 1) {
         origin: parsed.origin,
         destination: parsed.destination,
         date: parsed.departureDate,
-        originName: economyData.airports?.[0]?.departure?.[0]?.airport?.name || parsed.origin,
-        destinationName: economyData.airports?.[0]?.arrival?.[0]?.airport?.name || parsed.destination,
+        originName: parsed.origin,
+        destinationName: parsed.destination,
       },
       flights: flights,
       totalFound: flights.length,
-      priceInsights: economyData.price_insights || null,
+      priceInsights: null,
     };
 
   } catch (error) {
-    console.error('❌ SerpApi Error:', error.message);
-    return { error: `Flight search failed: ${error.message}` };
+    console.error('\u274C Amadeus Flights Error:', error.description || error.message);
+    return { error: `Flight search failed: ${error.description?.[0]?.detail || error.message}` };
   }
 }
 
 // Format results for display
 function formatFlightResults(results) {
   if (results.error) {
-    return `❌ ${results.error}`;
+    return `\u274C ${results.error}`;
   }
 
-  const { route, flights, totalFound, priceInsights } = results;
+  const { route, flights, totalFound } = results;
 
-  let output = `✈️ **${route.originName || route.origin} → ${route.destinationName || route.destination}**\n`;
-  output += `📅 ${route.date}\n`;
-  output += `🔍 ${totalFound} flights found (Google Flights)\n`;
-
-  // Price insights
-  if (priceInsights) {
-    output += `💡 Prices are ${priceInsights.price_level || 'typical'} right now\n`;
-  }
+  let output = `\u2708\uFE0F **${route.originName || route.origin} \u2192 ${route.destinationName || route.destination}**\n`;
+  output += `\uD83D\uDCC5 ${route.date}\n`;
+  output += `\uD83D\uDD0D ${totalFound} flights found (Amadeus)\n`;
   output += `\n`;
 
   flights.forEach((f) => {
     const stopsText = f.stops === 0 ? 'Non-stop' : `${f.stops} stop${f.stops > 1 ? 's' : ''}`;
 
-    output += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    output += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n`;
     output += `**${f.rank}. ${f.airline}** - ${f.flightNumber}\n`;
-    output += `🛫 Departure: ${f.departure.time} (${f.departure.airport})\n`;
-    output += `🛬 Arrival: ${f.arrival.time} (${f.arrival.airport})\n`;
-    output += `⏱️ Duration: ${f.duration}\n`;
-    output += `🔄 Type: ${stopsText}\n`;
+    output += `\uD83D\uDEEB Departure: ${f.departure.time} (${f.departure.airport})\n`;
+    output += `\uD83D\uDEEC Arrival: ${f.arrival.time} (${f.arrival.airport})\n`;
+    output += `\u23F1\uFE0F Duration: ${f.duration}\n`;
+    output += `\uD83D\uDD04 Type: ${stopsText}\n`;
     if (f.stopDetails.length > 0) {
-      output += `📍 Via: ${f.stopDetails.join(', ')}\n`;
+      output += `\uD83D\uDCCD Via: ${f.stopDetails.join(', ')}\n`;
     }
     if (f.layoverInfo.length > 0) {
-      output += `⏳ Layover: ${f.layoverInfo.join(', ')}\n`;
+      output += `\u23F3 Layover: ${f.layoverInfo.join(', ')}\n`;
     }
     if (f.price.economy > 0) {
-      output += `💰 Economy: **₹${f.price.economy.toLocaleString('en-IN')}**\n`;
+      output += `\uD83D\uDCB0 Economy: **\u20B9${f.price.economy.toLocaleString('en-IN')}**\n`;
     } else {
-      output += `💰 Economy: Price not available\n`;
+      output += `\uD83D\uDCB0 Economy: Price not available\n`;
     }
     if (f.price.premiumEconomy && f.price.premiumEconomy > 0) {
-      output += `💎 Premium Economy: **₹${f.price.premiumEconomy.toLocaleString('en-IN')}**\n`;
+      output += `\uD83D\uDC8E Premium Economy: **\u20B9${f.price.premiumEconomy.toLocaleString('en-IN')}**\n`;
     }
-    output += `✈️ Aircraft: ${f.airplane}\n`;
-    if (f.legroom !== 'N/A') {
-      output += `🦵 Legroom: ${f.legroom}\n`;
-    }
-    if (f.carbonEmissions) {
-      output += `🌱 Emissions: ${f.carbonEmissions}\n`;
-    }
-    if (f.extensions.length > 0) {
-      output += `ℹ️ ${f.extensions.join(' • ')}\n`;
-    }
+    output += `\u2708\uFE0F Aircraft: ${f.airplane}\n`;
     output += `\n`;
   });
 
   // Summary
   if (flights.length > 0) {
-    // Only consider flights with valid prices for cheapest
     const flightsWithPrice = flights.filter(f => f.price.economy > 0);
     const cheapest = flightsWithPrice.length > 0
       ? flightsWithPrice.reduce((min, f) => f.price.economy < min.price.economy ? f : min, flightsWithPrice[0])
@@ -400,30 +411,34 @@ function formatFlightResults(results) {
     }, flights[0]);
     const nonStop = flights.filter(f => f.stops === 0);
 
-    output += `📊 **Summary:**\n`;
+    output += `\uD83D\uDCCA **Summary:**\n`;
     if (cheapest) {
-      output += `• 💰 Cheapest: ${cheapest.airline} ${cheapest.flightNumber} at ₹${cheapest.price.economy.toLocaleString('en-IN')}\n`;
+      output += `\u2022 \uD83D\uDCB0 Cheapest: ${cheapest.airline} ${cheapest.flightNumber} at \u20B9${cheapest.price.economy.toLocaleString('en-IN')}\n`;
     }
-    output += `• ⚡ Fastest: ${fastest.airline} ${fastest.flightNumber} (${fastest.duration})\n`;
+    output += `\u2022 \u26A1 Fastest: ${fastest.airline} ${fastest.flightNumber} (${fastest.duration})\n`;
     if (nonStop.length > 0) {
-      output += `• ✅ Non-stop: ${nonStop.length} available\n`;
+      output += `\u2022 \u2705 Non-stop: ${nonStop.length} available\n`;
     }
   }
 
-  output += `\n🔗 **Book on:**\n`;
-  output += `• [Google Flights](https://www.google.com/travel/flights/search?tfs=CBwQAhooEgoyMDI2LTAyLTEwagwIAhIIL20vMDljMTdyDAgCEggvbS8wZGxjdkABSAFwAYIBCwj___________8BmAEB)\n`;
-  output += `• [MakeMyTrip](https://www.makemytrip.com/flights/)\n`;
-  output += `• [Cleartrip](https://www.cleartrip.com/flights/)\n`;
+  output += `\n\uD83D\uDD17 **Book on:**\n`;
+  output += `\u2022 [Google Flights](https://www.google.com/travel/flights)\n`;
+  output += `\u2022 [MakeMyTrip](https://www.makemytrip.com/flights/)\n`;
+  output += `\u2022 [Cleartrip](https://www.cleartrip.com/flights/)\n`;
 
   return output;
 }
 
 function init() {
-  if (config.serpapi?.apiKey) {
-    console.log('✈️ SerpApi: Google Flights enabled');
+  if (config.amadeus?.clientId && config.amadeus?.clientSecret) {
+    amadeus = new Amadeus({
+      clientId: config.amadeus.clientId,
+      clientSecret: config.amadeus.clientSecret,
+    });
+    console.log('\u2708\uFE0F Amadeus: Flight search enabled');
     return true;
   }
-  console.log('⚠️ SerpApi: Not configured (add SERPAPI_KEY)');
+  console.log('\u26A0\uFE0F Amadeus: Not configured (add AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET)');
   return false;
 }
 
