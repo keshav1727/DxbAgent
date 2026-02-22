@@ -3,8 +3,8 @@ const { openai } = require('@ai-sdk/openai');
 const { tavily } = require('@tavily/core');
 const config = require('../config');
 const { needsSearch, isFlightQuery } = require('../utils/helpers');
-const { searchFlights, formatFlightResults } = require('./googleflights');
-const { searchHotels, formatHotelResults, getMissingHotelInfo, buildHotelPrompt } = require('./googlehotels');
+const { searchFlights, formatFlightResults } = require('./serpflights');
+const { searchHotels, formatHotelResults, getMissingHotelInfo, buildHotelPrompt } = require('./serphotels');
 const { getTopic } = require('../utils/memory');
 
 const tavilyClient = tavily({ apiKey: config.tavily.apiKey });

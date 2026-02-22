@@ -2,8 +2,8 @@ const express = require('express');
 const config = require('./src/config');
 const telegram = require('./src/services/telegram');
 const whatsapp = require('./src/services/whatsapp');
-const googleflights = require('./src/services/googleflights');
-const googlehotels = require('./src/services/googlehotels');
+const serpflights = require('./src/services/serpflights');
+const serphotels = require('./src/services/serphotels');
 const { connectDB } = require('./src/services/chatHistory');
 
 console.log('🤖 Multi-Platform AI Agent starting...');
@@ -19,8 +19,8 @@ console.log('🤖 Multi-Platform AI Agent starting...');
 
   // Initialize services
   telegram.init();
-  const flightsEnabled = googleflights.init();
-  const hotelsEnabled = googlehotels.init();
+  const flightsEnabled = serpflights.init();
+  const hotelsEnabled = serphotels.init();
 
   // WhatsApp webhook
   app.post('/webhook/whatsapp', whatsapp.handleWebhook);
@@ -39,8 +39,8 @@ console.log('🤖 Multi-Platform AI Agent starting...');
   console.log('📱 Telegram: Active');
   console.log('💬 WhatsApp: Active');
   console.log('🔍 Tavily: Real-time search');
-  console.log(`✈️ Google Flights: ${flightsEnabled ? 'Real-time flights' : 'Not configured'}`);
-  console.log(`🏨 Google Hotels: ${hotelsEnabled ? 'Real-time hotels' : 'Not configured'}`);
+  console.log(`✈️ SerpAPI Flights: ${flightsEnabled ? 'Real-time Google Flights' : 'Not configured (add SERPAPI_API_KEY)'}`);
+  console.log(`🏨 SerpAPI Hotels: ${hotelsEnabled ? 'Real-time Google Hotels' : 'Not configured (add SERPAPI_API_KEY)'}`);
   console.log('🤖 GPT-4.1 AI');
   console.log('');
   console.log('🎯 Capabilities: Flights, Visa, Weather, News, Search');
