@@ -137,9 +137,9 @@ function formatDuration(totalMinutes) {
 }
 
 // Parse natural language flight query
-function parseFlightQuery(query) {
+function parseFlightQuery(query, messageTimestamp = Date.now()) {
   const lower = query.toLowerCase();
-  const today = new Date();
+  const today = new Date(messageTimestamp);
 
   const monthMap = {
     'jan': 0, 'feb': 1, 'mar': 2, 'apr': 3, 'may': 4, 'jun': 5,
@@ -162,14 +162,14 @@ function parseFlightQuery(query) {
     }
   }
 
-  if (lower.includes('today')) {
+  if (lower.includes('day after tomorrow')) {
     departureDate = new Date(today);
+    departureDate.setDate(today.getDate() + 2);
   } else if (lower.includes('tomorrow')) {
     departureDate = new Date(today);
     departureDate.setDate(today.getDate() + 1);
-  } else if (lower.includes('day after tomorrow')) {
+  } else if (lower.includes('today')) {
     departureDate = new Date(today);
-    departureDate.setDate(today.getDate() + 2);
   }
 
   if (!departureDate) {
@@ -182,13 +182,22 @@ function parseFlightQuery(query) {
   const day = String(departureDate.getDate()).padStart(2, '0');
   const formattedDate = `${year}-${month}-${day}`;
 
+  // Strip date/noise words before extracting cities
+  const stripped = lower
+    .replace(/\b(day after tomorrow|tomorrow|today|tonight|next week|next month)\b/gi, '')
+    .replace(/(\d{1,2})(?:st|nd|rd|th)?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*/gi, '')
+    .replace(/\s+/g, ' ').trim();
+
   // Extract origin and destination
   let origin = null;
   let destination = null;
 
+  // Prefer explicit "from X to Y" with lazy match
   const fromToMatch =
-    lower.match(/(?:from\s+)?([a-z\s]+)\s+to\s+([a-z\s]+?)(?:\s+(?:on|for|tomorrow|today|next|\d))/i) ||
-    lower.match(/(?:from\s+)?([a-z\s]+)\s+to\s+([a-z\s]+)/i);
+    stripped.match(/from\s+([a-z\s]+?)\s+to\s+([a-z\s]+?)(?:\s+(?:on|for|next|\d)|$)/i) ||
+    stripped.match(/from\s+([a-z\s]+?)\s+to\s+([a-z\s]+)/i) ||
+    stripped.match(/([a-z\s]+?)\s+to\s+([a-z\s]+?)(?:\s+(?:on|for|next|\d)|$)/i) ||
+    stripped.match(/([a-z\s]+?)\s+to\s+([a-z\s]+)/i);
 
   if (fromToMatch) {
     origin = fromToMatch[1].trim();
@@ -196,7 +205,7 @@ function parseFlightQuery(query) {
   }
 
   const cleanCity = (city) =>
-    city.replace(/\b(flight|flights|from|cheap|cheapest|book|booking|for|on|the|a)\b/gi, '').trim();
+    city.replace(/\b(flight|flights|from|cheap|cheapest|book|booking|for|on|the|a|tomorrow|today|tonight)\b/gi, '').trim();
 
   if (origin) origin = cleanCity(origin);
   if (destination) destination = cleanCity(destination);
@@ -208,20 +217,40 @@ function parseFlightQuery(query) {
   };
 }
 
-// Build a Google Flights booking URL
-function buildBookingUrl(origin, destination, date, bookingToken) {
-  if (bookingToken) {
-    return `https://www.google.com/travel/flights?hl=en&tfs=${encodeURIComponent(bookingToken)}`;
-  }
+// Fallback URL when we can't get a direct booking link
+function fallbackBookingUrl(origin, destination, date) {
   return `https://www.google.com/travel/flights/search?q=flights+from+${origin}+to+${destination}+on+${date}&hl=en&curr=INR`;
+}
+
+// Call SerpAPI google_flights_booking engine to get a direct booking page URL
+// Returns a URL that lands on the booking page with the flight pre-selected
+async function fetchDirectBookingUrl(bookingToken, origin, destination, date) {
+  if (!bookingToken) return fallbackBookingUrl(origin, destination, date);
+  try {
+    const data = await getJson({
+      engine: 'google_flights_booking',
+      api_key: config.serpapi.apiKey,
+      booking_token: bookingToken,
+    });
+    if (data.error) return fallbackBookingUrl(origin, destination, date);
+    return data.booking_link || fallbackBookingUrl(origin, destination, date);
+  } catch {
+    return fallbackBookingUrl(origin, destination, date);
+  }
 }
 
 // Fetch flights for a single cabin class (1=Economy, 2=PremiumEconomy, 3=Business)
 async function fetchByClass(params, travelClass) {
+  const classNames = { 1: 'Economy', 2: 'Premium Economy', 3: 'Business' };
   try {
     const data = await getJson({ ...params, travel_class: travelClass });
+    if (data.error) {
+      console.error(`❌ SerpAPI [${classNames[travelClass]}]:`, data.error);
+      return [];
+    }
     return [...(data.best_flights || []), ...(data.other_flights || [])];
-  } catch {
+  } catch (err) {
+    console.error(`❌ SerpAPI [${classNames[travelClass]}]:`, err.message);
     return [];
   }
 }
@@ -233,12 +262,12 @@ function flightKey(offer) {
 }
 
 // Search flights — parallel calls for Economy, Premium Economy, Business
-async function searchFlights(query, adults = 1) {
+async function searchFlights(query, adults = 1, messageTimestamp = Date.now()) {
   if (!config.serpapi?.apiKey) {
     return { error: 'SerpAPI not configured. Add SERPAPI_API_KEY to .env.local' };
   }
 
-  const parsed = parseFlightQuery(query);
+  const parsed = parseFlightQuery(query, messageTimestamp);
 
   if (!parsed.origin || !parsed.destination) {
     return { error: 'Could not parse origin and destination. Use: "flights from [city] to [city]"' };
@@ -290,7 +319,31 @@ async function searchFlights(query, adults = 1) {
       }
     }
 
-    const flights = economyOffers.slice(0, 10).map((offer, index) => {
+    const topOffers = economyOffers.slice(0, 10);
+
+    // Collect all booking tokens we need to resolve (economy + premium + business per flight)
+    const tokenRequests = [];
+    for (const offer of topOffers) {
+      const key = flightKey(offer);
+      const ecoToken = offer.booking_token || null;
+      const preToken = premiumTokenMap.get(key) || null;
+      const bizToken = businessTokenMap.get(key) || null;
+      tokenRequests.push({ ecoToken, preToken, bizToken });
+    }
+
+    // Fetch all direct booking URLs in parallel (3 per flight max)
+    console.log(`🔗 Fetching direct booking URLs for ${topOffers.length} flights...`);
+    const resolvedUrls = await Promise.all(
+      tokenRequests.map(({ ecoToken, preToken, bizToken }) =>
+        Promise.all([
+          fetchDirectBookingUrl(ecoToken, parsed.origin, parsed.destination, parsed.departureDate),
+          preToken ? fetchDirectBookingUrl(preToken, parsed.origin, parsed.destination, parsed.departureDate) : Promise.resolve(null),
+          bizToken ? fetchDirectBookingUrl(bizToken, parsed.origin, parsed.destination, parsed.departureDate) : Promise.resolve(null),
+        ])
+      )
+    );
+
+    const flights = topOffers.map((offer, index) => {
       const segs = offer.flights || [];
       const firstSeg = segs[0] || {};
       const lastSeg = segs[segs.length - 1] || firstSeg;
@@ -303,10 +356,7 @@ async function searchFlights(query, adults = 1) {
       const premiumPrice = premiumPriceMap.get(key) || 0;
       const businessPrice = businessPriceMap.get(key) || 0;
 
-      // Use class-specific booking token if available, fall back to economy
-      const bookingToken = offer.booking_token || null;
-      const premiumToken = premiumTokenMap.get(key) || bookingToken;
-      const businessToken = businessTokenMap.get(key) || bookingToken;
+      const [ecoUrl, preUrl, bizUrl] = resolvedUrls[index];
 
       const stops = segs.length - 1;
       const stopAirports = segs.slice(0, -1).map((s) => s.arrival_airport?.id || '');
@@ -336,9 +386,9 @@ async function searchFlights(query, adults = 1) {
           business: businessPrice,
         },
         bookingUrl: {
-          economy: buildBookingUrl(parsed.origin, parsed.destination, parsed.departureDate, bookingToken),
-          premiumEconomy: buildBookingUrl(parsed.origin, parsed.destination, parsed.departureDate, premiumToken),
-          business: buildBookingUrl(parsed.origin, parsed.destination, parsed.departureDate, businessToken),
+          economy: ecoUrl,
+          premiumEconomy: preUrl || ecoUrl,
+          business: bizUrl || ecoUrl,
         },
       };
     });
@@ -401,6 +451,50 @@ function formatFlightResults(results) {
   return output;
 }
 
+// Convert duration string "2h 45m" → minutes
+function durationToMinutes(d) {
+  const m = d.match(/(\d+)h\s*(\d+)?m?/);
+  return m ? parseInt(m[1]) * 60 + (parseInt(m[2]) || 0) : 0;
+}
+
+// Build the structured INPUT for the GPT-4o flight analysis prompt
+function buildAnalysisInput(results) {
+  const { route, flights } = results;
+
+  const withPrice = flights.filter((f) => f.price.economy > 0);
+  const avgPrice = withPrice.length
+    ? Math.round(withPrice.reduce((s, f) => s + f.price.economy, 0) / withPrice.length)
+    : 0;
+
+  return {
+    route: { origin: route.origin, destination: route.destination, date: route.date },
+    currency: 'INR',
+    average_price: avgPrice,
+    flights: withPrice.map((f) => ({
+      airline: f.airline,
+      flight_number: f.flightNumber,
+      departure_airport: f.departure.airport,
+      arrival_airport: f.arrival.airport,
+      departure_time: f.departure.time,
+      arrival_time: f.arrival.time,
+      duration_minutes: durationToMinutes(f.duration),
+      stops: f.stops,
+      layover_city: f.stopDetails.length ? f.stopDetails.join(', ') : null,
+      aircraft_type: f.airplane !== 'N/A' ? f.airplane : null,
+      price: f.price.economy,
+      fare_type: 'Economy',
+      cabin_baggage: null,
+      checkin_baggage: null,
+      cancellation_policy: null,
+      reschedule_charges: null,
+      // Extra: carry multi-cabin prices through for display
+      _premiumEconomyPrice: f.price.premiumEconomy || 0,
+      _businessPrice: f.price.business || 0,
+      _bookingUrl: f.bookingUrl,
+    })),
+  };
+}
+
 function init() {
   if (config.serpapi?.apiKey) {
     console.log('✈️ SerpAPI: Flight search enabled (Google Flights)');
@@ -415,4 +509,5 @@ module.exports = {
   searchFlights,
   formatFlightResults,
   parseFlightQuery,
+  buildAnalysisInput,
 };

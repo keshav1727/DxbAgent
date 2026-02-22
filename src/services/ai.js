@@ -3,7 +3,7 @@ const { openai } = require('@ai-sdk/openai');
 const { tavily } = require('@tavily/core');
 const config = require('../config');
 const { needsSearch, isFlightQuery } = require('../utils/helpers');
-const { searchFlights, formatFlightResults } = require('./serpflights');
+const { searchFlights, formatFlightResults, buildAnalysisInput } = require('./serpflights');
 const { searchHotels, formatHotelResults, getMissingHotelInfo, buildHotelPrompt } = require('./serphotels');
 const { getTopic } = require('../utils/memory');
 
@@ -156,11 +156,23 @@ function buildSearchContext(results) {
   return context;
 }
 
+// Build date context string from message timestamp
+function buildDateContext(ts) {
+  const now = new Date(ts);
+  const tomorrow = new Date(ts);
+  tomorrow.setDate(now.getDate() + 1);
+  const dayAfter = new Date(ts);
+  dayAfter.setDate(now.getDate() + 2);
+
+  const fmt = (d) => d.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const fmtShort = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+
+  return `[DATE CONTEXT] Today is ${fmt(now)} (${fmtShort(now)}). Tomorrow is ${fmt(tomorrow)} (${fmtShort(tomorrow)}). Day after tomorrow is ${fmt(dayAfter)} (${fmtShort(dayAfter)}). When the user says "today", "tomorrow", "this weekend" etc., always use these exact dates.\n\n`;
+}
+
 // Specialized prompts for better output
-function getSystemPrompt(type, searchContext, flightData = null) {
-  const baseContext = searchContext
-    ? `Use these search results:\n\n${searchContext}\n\n`
-    : '';
+function getSystemPrompt(type, searchContext, flightData = null, dateContext = '') {
+  const baseContext = (dateContext || '') + (searchContext ? `Use these search results:\n\n${searchContext}\n\n` : '');
 
   // Build flight context from Google Flights data for follow-up queries
   let flightContext = '';
@@ -263,22 +275,224 @@ Keep it brief and useful.`,
   return prompts[type] || prompts.general;
 }
 
-async function generateResponse(messageText, conversationHistory = [], chatId = 'default') {
+const FLIGHT_ANALYSIS_PROMPT = `You are a Flight Data Analysis AI.
+
+You will receive structured flight search results from an external API.
+Your job is to:
+
+1. Normalize flight data.
+2. Identify:
+   - Cheapest flight
+   - Fastest flight
+   - Best value flight (balanced price vs duration)
+3. Categorize flights by time of day.
+4. Provide price intelligence vs average price.
+5. Return structured JSON output.
+6. DO NOT fabricate or hallucinate missing values.
+7. Use only the provided input data.
+
+YOUR TASK:
+
+1️⃣ FLIGHT OVERVIEW
+Return all flight details exactly as provided.
+
+2️⃣ SORTING METRICS
+- Cheapest flight = lowest price
+- Fastest flight = lowest duration_minutes
+- Best value flight = lowest (price / duration_minutes ratio)
+
+3️⃣ PRICE INTELLIGENCE
+Compare each flight price to average_price:
+- If > 10% above average → "High"
+- If within ±10% → "Normal"
+- If > 10% below average → "Good deal"
+
+Also generate:
+"Prices are X% above/below the route average."
+
+4️⃣ TIME CATEGORIZATION
+Based on departure_time:
+- Morning: 05:00–11:59
+- Afternoon: 12:00–16:59
+- Evening: 17:00–20:59
+- Night: 21:00–04:59
+
+Group flights into: { "morning": [], "afternoon": [], "evening": [], "night": [] }
+
+5️⃣ RETURN ONLY VALID JSON. NO explanation text before or after. This exact format:
+
+{
+  "summary": {
+    "total_flights": number,
+    "cheapest_flight_number": "",
+    "fastest_flight_number": "",
+    "best_value_flight_number": "",
+    "price_insight": ""
+  },
+  "categorized_flights": {
+    "morning": [],
+    "afternoon": [],
+    "evening": [],
+    "night": []
+  },
+  "flights": [
+    {
+      "airline": "",
+      "flight_number": "",
+      "departure_time": "",
+      "arrival_time": "",
+      "duration_minutes": number,
+      "stops": number,
+      "layover_city": "",
+      "aircraft_type": "",
+      "price": number,
+      "currency": "",
+      "fare_type": "",
+      "baggage": { "cabin": "", "checkin": "" },
+      "policies": { "cancellation": "", "reschedule": "" },
+      "price_vs_average_percent": number,
+      "price_category": "High / Normal / Good deal"
+    }
+  ]
+}
+
+STRICT RULES:
+- Never invent flights.
+- Never modify numeric values.
+- Do not assume missing baggage.
+- If aircraft_type missing → return null.
+- Only analyze provided data.
+- Return ONLY the JSON object, nothing else.`;
+
+// Call GPT-4o with the flight analysis prompt and return structured JSON
+async function analyzeFlights(analysisInput) {
+  try {
+    console.log('🧠 Analyzing flights with GPT...');
+    const { text } = await generateText({
+      model: openai(config.openai.model),
+      messages: [
+        { role: 'system', content: FLIGHT_ANALYSIS_PROMPT },
+        { role: 'user', content: JSON.stringify(analysisInput, null, 2) },
+      ],
+      temperature: 0.1,
+      maxTokens: 3000,
+    });
+
+    // Extract JSON — strip any markdown fences if present
+    const clean = text.replace(/```json|```/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    return JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    console.error('❌ Flight analysis failed:', err.message);
+    return null;
+  }
+}
+
+// Format the structured analysis JSON into readable chat output
+function formatAnalyzedFlights(analysis, originalFlights) {
+  const { summary, categorized_flights, flights } = analysis;
+
+  // Build a lookup for booking URLs from original data
+  const urlMap = {};
+  for (const f of (originalFlights || [])) {
+    urlMap[f.flightNumber] = f.bookingUrl;
+    urlMap[f.flightNumber + '_premium'] = f.price?.premiumEconomy || 0;
+    urlMap[f.flightNumber + '_business'] = f.price?.business || 0;
+  }
+
+  let out = '';
+
+  // Header
+  out += `✈️ **Flight Analysis**\n`;
+  out += `🔍 ${summary.total_flights} flights found\n`;
+  out += `💡 ${summary.price_insight}\n\n`;
+
+  // Highlights
+  out += `📊 **Highlights:**\n`;
+  out += `• 💰 Cheapest: **${summary.cheapest_flight_number}**\n`;
+  out += `• ⚡ Fastest: **${summary.fastest_flight_number}**\n`;
+  out += `• 🏆 Best Value: **${summary.best_value_flight_number}**\n\n`;
+
+  // Flights grouped by time of day
+  const timeSlots = [
+    { key: 'morning',   label: '🌅 Morning (05:00–11:59)',   emoji: '🌅' },
+    { key: 'afternoon', label: '☀️ Afternoon (12:00–16:59)', emoji: '☀️' },
+    { key: 'evening',   label: '🌆 Evening (17:00–20:59)',   emoji: '🌆' },
+    { key: 'night',     label: '🌙 Night (21:00–04:59)',     emoji: '🌙' },
+  ];
+
+  for (const slot of timeSlots) {
+    const group = categorized_flights[slot.key] || [];
+    if (group.length === 0) continue;
+
+    out += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    out += `${slot.label}\n\n`;
+
+    for (const fn of group) {
+      const f = flights.find((x) => x.flight_number === fn);
+      if (!f) continue;
+
+      const stopsText = f.stops === 0 ? 'Non-stop' : `${f.stops} stop${f.stops > 1 ? 's' : ''} via ${f.layover_city || ''}`;
+      const categoryBadge = f.price_category === 'Good deal' ? '🟢' : f.price_category === 'High' ? '🔴' : '🟡';
+      const pctSign = f.price_vs_average_percent > 0 ? '+' : '';
+      const urls = urlMap[f.flight_number];
+
+      out += `**${f.airline}** · ${f.flight_number}\n`;
+      out += `🕐 ${f.departure_time} → ${f.arrival_time} · ${Math.floor(f.duration_minutes / 60)}h ${f.duration_minutes % 60}m · ${stopsText}\n`;
+
+      // Economy price + badge
+      out += `💺 Economy: **₹${f.price.toLocaleString('en-IN')}** ${categoryBadge} (${pctSign}${f.price_vs_average_percent}% vs avg)`;
+      if (urls?.economy) out += ` — [Book](${urls.economy})`;
+      out += '\n';
+
+      // Premium economy if available
+      const premiumPrice = urlMap[f.flight_number + '_premium'];
+      if (premiumPrice > 0) {
+        out += `💺 Premium Economy: **₹${premiumPrice.toLocaleString('en-IN')}**`;
+        if (urls?.premiumEconomy) out += ` — [Book](${urls.premiumEconomy})`;
+        out += '\n';
+      }
+
+      // Business if available
+      const bizPrice = urlMap[f.flight_number + '_business'];
+      if (bizPrice > 0) {
+        out += `💼 Business: **₹${bizPrice.toLocaleString('en-IN')}**`;
+        if (urls?.business) out += ` — [Book](${urls.business})`;
+        out += '\n';
+      }
+
+      if (f.aircraft_type) out += `✈️ ${f.aircraft_type}\n`;
+      out += '\n';
+    }
+  }
+
+  return out.trim();
+}
+
+async function generateResponse(messageText, conversationHistory = [], chatId = 'default', messageTimestamp = Date.now()) {
   try {
     const queryType = detectQueryType(messageText);
+    const dateContext = buildDateContext(messageTimestamp);
     let searchContext = '';
     let flightData = null;
 
     // Use Google Flights for flight searches
     if (isFlightQuery(messageText) && needsSearch(messageText)) {
       console.log(`✈️ Searching flights via Google Flights...`);
-      const flightResults = await searchFlights(messageText);
+      const flightResults = await searchFlights(messageText, 1, messageTimestamp);
 
       if (flightResults.success) {
         // Store results for follow-up queries
         lastFlightResults.set(chatId, flightResults);
 
-        // Return formatted flight data directly
+        // Run GPT-4o analysis on the raw data
+        const analysisInput = buildAnalysisInput(flightResults);
+        const analysis = await analyzeFlights(analysisInput);
+        if (analysis) {
+          return formatAnalyzedFlights(analysis, flightResults.flights);
+        }
+        // Fallback to plain format if analysis fails
         return formatFlightResults(flightResults);
       } else if (flightResults.error) {
         // If Google Flights fails, fall back to web search
@@ -326,7 +540,7 @@ async function generateResponse(messageText, conversationHistory = [], chatId = 
       pendingHotelQueries.delete(chatId);
       lastHotelQuery.set(chatId, fullQuery);
       console.log(`🏨 Searching hotels via Google Hotels...`);
-      const hotelResults = await searchHotels(fullQuery);
+      const hotelResults = await searchHotels(fullQuery, 2, messageTimestamp);
 
       if (hotelResults.success) {
         return formatHotelResults(hotelResults);
@@ -345,7 +559,7 @@ async function generateResponse(messageText, conversationHistory = [], chatId = 
       }
     }
 
-    let systemPrompt = getSystemPrompt(queryType, searchContext, flightData);
+    let systemPrompt = getSystemPrompt(queryType, searchContext, flightData, dateContext);
 
     // Add context instruction for follow-up questions
     systemPrompt += `\n\nIMPORTANT: Maintain conversation continuity. If the user asks follow-up questions like "which is cheapest?", "tell me more", "what about budget options?", etc., refer to the previous context. Do not switch topics unless the user explicitly asks about something completely different.`;

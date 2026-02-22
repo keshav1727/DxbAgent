@@ -89,7 +89,7 @@ async function handleWebhook(req, res) {
           handleTopicChange(from, transcribedText);
 
           const history = getMessages(from);
-          const response = await generateResponse(transcribedText, history, from);
+          const response = await generateResponse(transcribedText, history, from, Date.now());
 
           // Save to memory
           addMessage(from, 'user', transcribedText);
@@ -186,7 +186,7 @@ async function handleWebhook(req, res) {
 
     // Get conversation history and generate response with context
     const history = getMessages(from);
-    const response = await generateResponse(fullContext, history, from);
+    const response = await generateResponse(fullContext, history, from, Date.now());
 
     // Save to memory
     addMessage(from, 'user', fullContext);

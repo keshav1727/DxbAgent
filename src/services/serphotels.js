@@ -13,9 +13,9 @@ const CURRENCY_SYMBOLS = {
 };
 
 // Parse hotel query — same logic as before so ai.js flow is unchanged
-function parseHotelQuery(query) {
+function parseHotelQuery(query, messageTimestamp = Date.now()) {
   const lower = query.toLowerCase();
-  const today = new Date();
+  const today = new Date(messageTimestamp);
 
   // Currency
   let currency = 'INR';
@@ -143,7 +143,7 @@ function parseHotelQuery(query) {
 function getMissingHotelInfo(query) {
   const lower = query.toLowerCase();
   const missing = [];
-  const parsed = parseHotelQuery(query);
+  const parsed = parseHotelQuery(query, messageTimestamp);
 
   if (!parsed.location) missing.push('location');
 
@@ -171,12 +171,12 @@ function buildHotelPrompt(missing) {
 }
 
 // Search hotels using SerpAPI Google Hotels engine
-async function searchHotels(query, adults = 2) {
+async function searchHotels(query, adults = 2, messageTimestamp = Date.now()) {
   if (!config.serpapi?.apiKey) {
     return { error: 'SerpAPI not configured. Add SERPAPI_API_KEY to .env.local' };
   }
 
-  const parsed = parseHotelQuery(query);
+  const parsed = parseHotelQuery(query, messageTimestamp);
 
   if (!parsed.location) {
     return { error: 'Could not find location. Use format: "hotels in [city]"' };
