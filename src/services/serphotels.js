@@ -1,5 +1,7 @@
-const { getJson } = require('serpapi');
+const axios = require('axios');
 const config = require('../config');
+
+const RAPIDAPI_HOST = 'booking-com15.p.rapidapi.com';
 
 const CURRENCY_MAP = {
   '$': 'USD', 'usd': 'USD', 'dollar': 'USD', 'dollars': 'USD',
@@ -12,7 +14,6 @@ const CURRENCY_SYMBOLS = {
   'USD': '$', 'EUR': '€', 'GBP': '£', 'INR': '₹',
 };
 
-// Parse hotel query — same logic as before so ai.js flow is unchanged
 function parseHotelQuery(query, messageTimestamp = Date.now()) {
   const lower = query.toLowerCase();
   const today = new Date(messageTimestamp);
@@ -69,7 +70,7 @@ function parseHotelQuery(query, messageTimestamp = Date.now()) {
 
   const nearAirport = lower.includes('near airport') || lower.includes('airport area');
   if (location) {
-    location = location.replace(/\b(hotel|hotels|in|at|near|around|the|for|of|under|below|budget|from|to|per|day|night|star|luxury|\d)\b/gi, '').trim();
+    location = location.replace(/\b(hotel|hotels|in|at|near|around|the|for|of|under|below|budget|from|to|per|day|night|star|luxury|today|tonight|tomorrow|\d)\b/gi, '').trim();
     if (nearAirport) location += ' airport';
   }
 
@@ -139,11 +140,10 @@ function parseHotelQuery(query, messageTimestamp = Date.now()) {
   return { location, checkIn: formatDate(checkIn), checkOut: formatDate(checkOut), minPrice, maxPrice, nearAirport, starRating, currency };
 }
 
-// Check what info is missing before we can search
 function getMissingHotelInfo(query) {
   const lower = query.toLowerCase();
   const missing = [];
-  const parsed = parseHotelQuery(query, messageTimestamp);
+  const parsed = parseHotelQuery(query);
 
   if (!parsed.location) missing.push('location');
 
@@ -160,9 +160,8 @@ function getMissingHotelInfo(query) {
   return { parsed, missing };
 }
 
-// Prompt asking for missing details
 function buildHotelPrompt(missing) {
-  let prompt = `🏨 I'll help you find hotels! Please share:\n\n`;
+  let prompt = `🏨 I'll help you find hotels on Booking.com! Please share:\n\n`;
   if (missing.includes('location')) prompt += `📍 **Location:** Which city or area?\n`;
   if (missing.includes('dates')) prompt += `📅 **Dates:** Check-in and check-out dates?\n`;
   if (missing.includes('budget')) prompt += `💰 **Budget:** Max price per night? (e.g., under 5k, under $150)\n`;
@@ -170,10 +169,30 @@ function buildHotelPrompt(missing) {
   return prompt;
 }
 
-// Search hotels using SerpAPI Google Hotels engine
+// Resolve destination to Booking.com dest_id + dest_type
+async function resolveDestination(location, apiKey) {
+  const res = await axios.get(`https://${RAPIDAPI_HOST}/api/v1/hotels/searchDestination`, {
+    params: { query: location },
+    headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': RAPIDAPI_HOST },
+  });
+  const results = res.data?.data || [];
+  // Prefer city, then district, then any
+  const city = results.find(r => r.search_type === 'city')
+    || results.find(r => r.search_type === 'district')
+    || results[0];
+  return city ? { dest_id: city.dest_id, dest_type: city.search_type || 'city', label: city.city_name || city.label || location } : null;
+}
+
+// Build Booking.com direct URL for a hotel
+function buildHotelUrl(hotelId, checkIn, checkOut, adults) {
+  return `https://www.booking.com/hotel/in/id${hotelId}.html?checkin=${checkIn}&checkout=${checkOut}&group_adults=${adults}&no_rooms=1&lang=en-gb&currency_code=INR`;
+}
+
+// Search hotels using Booking.com API via RapidAPI
 async function searchHotels(query, adults = 2, messageTimestamp = Date.now()) {
-  if (!config.serpapi?.apiKey) {
-    return { error: 'SerpAPI not configured. Add SERPAPI_API_KEY to .env.local' };
+  const apiKey = config.rapidapi?.apiKey;
+  if (!apiKey) {
+    return { error: 'Booking.com API not configured. Add RAPIDAPI_KEY to .env.local' };
   }
 
   const parsed = parseHotelQuery(query, messageTimestamp);
@@ -183,110 +202,108 @@ async function searchHotels(query, adults = 2, messageTimestamp = Date.now()) {
   }
 
   const sym = CURRENCY_SYMBOLS[parsed.currency] || parsed.currency;
-  console.log(`🏨 SerpAPI Hotels: ${parsed.location} | ${parsed.checkIn} → ${parsed.checkOut} | ${parsed.currency}`);
-  if (parsed.maxPrice) {
-    console.log(`   Budget: ${parsed.minPrice ? sym + parsed.minPrice + ' – ' : 'Under '}${sym}${parsed.maxPrice}`);
-  }
+  console.log(`🏨 Booking.com: ${parsed.location} | ${parsed.checkIn} → ${parsed.checkOut} | ${parsed.currency}`);
 
   try {
+    // Step 1: resolve destination
+    const dest = await resolveDestination(parsed.location, apiKey);
+    if (!dest) {
+      return { error: `Could not find "${parsed.location}" on Booking.com` };
+    }
+    console.log(`🏨 Destination: ${dest.label} (id: ${dest.dest_id}, type: ${dest.dest_type})`);
+
+    // Step 2: search hotels
     const params = {
-      engine: 'google_hotels',
-      api_key: config.serpapi.apiKey,
-      q: `Hotels in ${parsed.location}`,
-      check_in_date: parsed.checkIn,
-      check_out_date: parsed.checkOut,
+      dest_id: dest.dest_id,
+      search_type: dest.dest_type,
+      arrival_date: parsed.checkIn,
+      departure_date: parsed.checkOut,
       adults: String(adults),
-      currency: parsed.currency,
-      hl: 'en',
-      gl: 'us',
+      room_qty: '1',
+      languagecode: 'en-us',
+      currency_code: parsed.currency,
+      page_number: '1',
     };
 
     if (parsed.starRating) {
-      // SerpAPI hotel_class filter: 2=2-star, 3=3-star, 4=4-star, 5=5-star
-      params.hotel_class = String(parsed.starRating);
+      params.categories_filter = `class::${parsed.starRating}`;
     }
 
-    const data = await getJson(params);
-    let properties = data.properties || [];
+    if (parsed.maxPrice) {
+      params.price_filter_currency = parsed.currency;
+      params.price_max = String(parsed.maxPrice);
+      if (parsed.minPrice) params.price_min = String(parsed.minPrice);
+    }
+
+    const res = await axios.get(`https://${RAPIDAPI_HOST}/api/v1/hotels/searchHotels`, {
+      params,
+      headers: { 'X-RapidAPI-Key': apiKey, 'X-RapidAPI-Host': RAPIDAPI_HOST },
+    });
+
+    let properties = res.data?.data?.hotels || [];
+    console.log(`🏨 Booking.com results: ${properties.length} hotels`);
 
     if (properties.length === 0) {
       return { error: `No hotels found in ${parsed.location} for ${parsed.checkIn} to ${parsed.checkOut}` };
     }
 
-    console.log(`🏨 Raw results: ${properties.length} hotels`);
-
-    // Filter by budget (using lowest per-night rate)
-    if (parsed.maxPrice || parsed.minPrice) {
-      properties = properties.filter((p) => {
-        const rate = p.prices?.[0]?.rate_per_night?.extracted_lowest;
-        if (!rate) return true; // keep if no price info
-        if (parsed.maxPrice && rate > parsed.maxPrice) return false;
-        if (parsed.minPrice && rate < parsed.minPrice) return false;
-        return true;
+    // Filter by budget if not sent as API param (fallback)
+    if (parsed.maxPrice) {
+      properties = properties.filter(p => {
+        const price = p.min_total_price || p.price_breakdown?.gross_price;
+        if (!price) return true;
+        return price <= parsed.maxPrice;
       });
-      console.log(`🏨 After budget filter: ${properties.length} hotels`);
     }
 
     if (properties.length === 0) {
-      return { error: `No hotels found in ${parsed.location} within budget ${parsed.maxPrice ? sym + parsed.maxPrice + '/night' : ''}` };
+      return { error: `No hotels found in ${parsed.location} within budget ${sym}${parsed.maxPrice}/night` };
     }
-
-    // Sort by price (cheapest first), then by rating for same price
-    properties.sort((a, b) => {
-      const priceA = a.prices?.[0]?.rate_per_night?.extracted_lowest || 999999;
-      const priceB = b.prices?.[0]?.rate_per_night?.extracted_lowest || 999999;
-      if (priceA !== priceB) return priceA - priceB;
-      return (b.overall_rating || 0) - (a.overall_rating || 0);
-    });
 
     const nights = Math.max(1, Math.round(
       (new Date(parsed.checkOut) - new Date(parsed.checkIn)) / 86400000
     ));
 
-    const hotels = properties.slice(0, 20).map((p, index) => {
-      const priceInfo = p.prices?.[0]?.rate_per_night || {};
-      const perNight = priceInfo.extracted_lowest || 0;
-      const perNightBeforeTax = priceInfo.extracted_before_taxes_fees || 0;
-      const sources = (p.prices || []).map((pr) => ({
-        name: pr.source || 'Unknown',
-        price: pr.rate_per_night?.extracted_lowest || 0,
-        link: pr.link || null,
-      }));
+    const hotels = properties.slice(0, 15).map((p, index) => {
+      const property = p.property || p;
+      const priceInfo = p.priceBreakdown || {};
+      const grossPrice = priceInfo.grossPrice?.value || property.priceBreakdown?.grossPrice?.value || 0;
+      const totalPrice = Math.round(grossPrice);
+      const perNight = nights > 0 ? Math.round(totalPrice / nights) : totalPrice;
+      const hotelId = property.id || p.hotel_id;
+      const bookingLink = property.wishlistName
+        ? `https://www.booking.com/hotel/${hotelId}.html?checkin=${parsed.checkIn}&checkout=${parsed.checkOut}&group_adults=${adults}&no_rooms=1&currency_code=INR`
+        : buildHotelUrl(hotelId, parsed.checkIn, parsed.checkOut, adults);
 
-      // Build booking link — prefer cheapest source link, else hotel direct link
-      const bookingLink = sources[0]?.link || p.link || null;
+      const reviewScore = property.reviewScore?.score || property.review_score;
+      const reviewCount = property.reviewScore?.reviewCount || property.review_nr;
 
       return {
         rank: index + 1,
-        name: p.name || 'Unknown Hotel',
-        type: p.type || 'Hotel',
-        stars: p.extracted_hotel_class ? '⭐'.repeat(p.extracted_hotel_class) : null,
-        starsNum: p.extracted_hotel_class || null,
-        hotelClass: p.hotel_class || null,
-        rating: p.overall_rating || null,
-        reviews: p.reviews || null,
-        location: p.neighborhood || parsed.location,
-        description: p.description || null,
-        checkInTime: p.check_in_time || null,
-        checkOutTime: p.check_out_time || null,
+        name: property.name || p.hotel_name || 'Unknown Hotel',
+        hotelClass: property.propertyClass ? `${property.propertyClass}-star hotel` : (p.class ? `${p.class}-star hotel` : null),
+        starsNum: property.propertyClass || p.class || null,
+        rating: reviewScore ? parseFloat(reviewScore).toFixed(1) : null,
+        ratingWord: property.reviewScore?.translateScore || p.review_score_word || null,
+        reviews: reviewCount || null,
+        location: property.wishlistName || p.address || parsed.location,
+        city: parsed.location,
+        freeCancellation: priceInfo.excludedPrice != null || p.is_free_cancellable === 1,
+        breakfastIncluded: p.has_free_breakfast === 1,
         price: {
           perNight,
-          perNightBeforeTax,
-          total: perNight * nights,
+          total: totalPrice,
           currency: parsed.currency,
         },
-        bookingSources: sources,
-        bookingLink,
-        amenities: p.amenities || [],
-        deal: p.deal || null,
-        dealDescription: p.deal_description || null,
+        bookingLink: buildHotelUrl(hotelId, parsed.checkIn, parsed.checkOut, adults),
+        amenities: [],
       };
     });
 
     return {
       success: true,
       search: {
-        location: parsed.location,
+        location: dest.label || parsed.location,
         checkIn: parsed.checkIn,
         checkOut: parsed.checkOut,
         nights,
@@ -299,74 +316,12 @@ async function searchHotels(query, adults = 2, messageTimestamp = Date.now()) {
       totalFound: hotels.length,
     };
   } catch (error) {
-    console.error('❌ SerpAPI Hotels Error:', error.message);
-    return { error: `Hotel search failed: ${error.message}` };
+    console.error('❌ Booking.com API Error:', error.response?.data || error.message);
+    const msg = error.response?.data?.message || error.message;
+    return { error: `Booking.com search failed: ${msg}` };
   }
 }
 
-// Detailed card for each hotel
-function formatHotelDetailed(h, sym) {
-  const fmt = (val) => sym === '₹' ? `${sym}${val.toLocaleString('en-IN')}` : `${sym}${val.toLocaleString()}`;
-
-  let output = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-  output += `**${h.rank}. ${h.name}**`;
-  if (h.hotelClass) output += ` (${h.hotelClass})`;
-  output += `\n`;
-
-  if (h.rating) output += `⭐ ${h.rating}/5`;
-  if (h.reviews) output += ` (${h.reviews.toLocaleString()} reviews)`;
-  if (h.rating || h.reviews) output += `\n`;
-
-  if (h.location) output += `📍 ${h.location}\n`;
-
-  if (h.price.perNight > 0) {
-    output += `💰 **${fmt(h.price.perNight)}/night**`;
-    if (h.price.perNightBeforeTax && h.price.perNightBeforeTax !== h.price.perNight) {
-      output += ` (before tax: ${fmt(h.price.perNightBeforeTax)})`;
-    }
-    output += `\n`;
-    if (h.price.total > 0) output += `🧾 Total stay: ${fmt(h.price.total)}\n`;
-  } else {
-    output += `💰 Price not available\n`;
-  }
-
-  if (h.deal) {
-    output += `🏷️ Deal: ${h.deal}`;
-    if (h.dealDescription) output += ` — ${h.dealDescription}`;
-    output += `\n`;
-  }
-
-  if (h.amenities.length > 0) {
-    output += `✅ Amenities: ${h.amenities.slice(0, 5).join(', ')}\n`;
-  }
-
-  if (h.bookingSources.length > 0) {
-    const src = h.bookingSources[0];
-    output += `🏬 Source: ${src.name}`;
-    if (src.price > 0) output += ` — ${fmt(src.price)}/night`;
-    output += `\n`;
-  }
-
-  if (h.bookingLink) {
-    output += `🔗 [Book Now](${h.bookingLink})\n`;
-  }
-
-  output += `\n`;
-  return output;
-}
-
-// Compact one-liner for overflow hotels
-function formatHotelCompact(h, sym) {
-  const fmt = (val) => sym === '₹' ? `${sym}${val.toLocaleString('en-IN')}` : `${sym}${val.toLocaleString()}`;
-  const price = h.price.perNight > 0 ? fmt(h.price.perNight) : 'N/A';
-  const rating = h.rating ? `⭐${h.rating}` : '';
-  const cls = h.hotelClass || '';
-  const info = [cls, rating].filter(Boolean).join(' ');
-  const link = h.bookingLink ? ` — [Book](${h.bookingLink})` : '';
-  return `${h.rank}. **${h.name}** — ${price}/night ${info}${link}\n`;
-}
-
-// Format full results for chat output
 function formatHotelResults(results) {
   if (results.error) return `❌ ${results.error}`;
 
@@ -380,43 +335,57 @@ function formatHotelResults(results) {
   if (search.maxPrice) {
     output += `💰 Budget: ${search.minPrice ? fmt(search.minPrice) + ' – ' : 'Under '}${fmt(search.maxPrice)}/night\n`;
   }
-  output += `🔍 **${totalFound} hotels found** (Google Hotels via SerpAPI)\n\n`;
+  output += `🔍 **${totalFound} hotels found on Booking.com**\n\n`;
 
-  const detailedCount = Math.min(10, hotels.length);
-  for (let i = 0; i < detailedCount; i++) {
-    output += formatHotelDetailed(hotels[i], sym);
-  }
-
-  if (hotels.length > detailedCount) {
+  hotels.forEach(h => {
     output += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    output += `📋 **More options (${hotels.length - detailedCount} more):**\n\n`;
-    for (let i = detailedCount; i < hotels.length; i++) {
-      output += formatHotelCompact(hotels[i], sym);
-    }
+    output += `**${h.rank}. ${h.name}**`;
+    if (h.hotelClass) output += ` (${h.hotelClass})`;
     output += `\n`;
-  }
 
-  const withPrice = hotels.filter((h) => h.price.perNight > 0);
+    if (h.rating) {
+      output += `⭐ ${h.rating}/10`;
+      if (h.ratingWord) output += ` · ${h.ratingWord}`;
+      if (h.reviews) output += ` (${h.reviews.toLocaleString()} reviews)`;
+      output += `\n`;
+    }
+
+    if (h.location) output += `📍 ${h.location}\n`;
+
+    if (h.price.perNight > 0) {
+      output += `💰 **${fmt(h.price.perNight)}/night**`;
+      if (h.price.total > 0 && search.nights > 1) output += ` · Total: ${fmt(h.price.total)}`;
+      output += `\n`;
+    } else {
+      output += `💰 Price not available\n`;
+    }
+
+    const badges = [];
+    if (h.freeCancellation) badges.push('✅ Free cancellation');
+    if (h.breakfastIncluded) badges.push('🍳 Breakfast included');
+    if (badges.length) output += `${badges.join(' · ')}\n`;
+
+    output += `🔗 [Book on Booking.com](${h.bookingLink})\n\n`;
+  });
+
+  const withPrice = hotels.filter(h => h.price.perNight > 0);
   if (withPrice.length > 0) {
-    const cheapest = withPrice[0];
-    const priciest = withPrice[withPrice.length - 1];
-    output += `📊 **Summary:**\n`;
-    output += `• Total: ${totalFound} hotels\n`;
-    output += `• Price range: ${fmt(cheapest.price.perNight)} – ${fmt(priciest.price.perNight)}/night\n`;
-    output += `• 💰 Cheapest: ${cheapest.name} at ${fmt(cheapest.price.perNight)}/night`;
-    if (cheapest.bookingLink) output += ` — [Book](${cheapest.bookingLink})`;
-    output += `\n`;
+    const cheapest = withPrice.reduce((a, b) => a.price.perNight < b.price.perNight ? a : b);
+    const topRated = hotels.filter(h => h.rating).reduce((a, b) => parseFloat(a.rating) > parseFloat(b.rating) ? a : b, hotels[0]);
+    output += `📊 **Quick Summary:**\n`;
+    output += `• 💰 Cheapest: ${cheapest.name} — ${fmt(cheapest.price.perNight)}/night\n`;
+    if (topRated?.rating) output += `• 🏆 Top rated: ${topRated.name} — ${topRated.rating}/10\n`;
   }
 
   return output;
 }
 
 function init() {
-  if (config.serpapi?.apiKey) {
-    console.log('🏨 SerpAPI: Hotel search enabled (Google Hotels)');
+  if (config.rapidapi?.apiKey) {
+    console.log('🏨 Booking.com: Hotel search enabled (RapidAPI)');
     return true;
   }
-  console.log('⚠️ SerpAPI: Hotel search not configured (add SERPAPI_API_KEY)');
+  console.log('⚠️ Booking.com: Not configured (add RAPIDAPI_KEY to .env.local)');
   return false;
 }
 

@@ -6,17 +6,24 @@ const { needsSearch, isFlightQuery } = require('../utils/helpers');
 const { searchFlights, formatFlightResults, buildAnalysisInput } = require('./serpflights');
 const { searchHotels, formatHotelResults, getMissingHotelInfo, buildHotelPrompt } = require('./serphotels');
 const { getTopic } = require('../utils/memory');
+const { createTicket } = require('./chatHistory');
 
 const tavilyClient = tavily({ apiKey: config.tavily.apiKey });
 
 // Store last flight search results for follow-up queries
 const lastFlightResults = new Map();
 
+// Store pending booking context (waiting for passenger/class details)
+const pendingBookings = new Map();
+
 // Store pending hotel queries waiting for missing info
 const pendingHotelQueries = new Map();
 
 // Store last completed hotel query so follow-ups can build on it
 const lastHotelQuery = new Map();
+
+// Store pending ticket creation (waiting for issue description)
+const pendingTickets = new Map();
 
 // Direct translation function - returns ONLY the translated text
 async function translateText(text, targetLanguage) {
@@ -205,8 +212,8 @@ function getSystemPrompt(type, searchContext, flightData = null, dateContext = '
 
   const prompts = {
     flight: flightData
-      ? `${flightContext}\nYou are a flight assistant. Answer the user's question using ONLY the flight data above. Be specific with flight numbers, times, and prices. Do not make up any information.`
-      : `${baseContext}You are a flight search assistant. If you don't have real flight data, ask the user to search for flights with origin, destination and date.`,
+      ? `${flightContext}\nYou are a flight assistant. Answer the user's question using ONLY the flight data above. Be specific with flight numbers, times, and prices. Do not make up any information.\n\nCRITICAL: NEVER ask for personal details (name, DOB, gender, contact, passport, payment). NEVER handle booking yourself. If the user wants to book, just tell them: reply with "book [flight number]" e.g. book 6E 6788.`
+      : `${baseContext}You are a flight search assistant. If you don't have real flight data, ask the user to search for flights with origin, destination and date. NEVER ask for personal details or handle bookings.`,
 
     hotel: `${baseContext}You are a hotel search assistant. Show hotels with EXACT prices from booking platforms.
 
@@ -389,93 +396,226 @@ async function analyzeFlights(analysisInput) {
   }
 }
 
-// Format the structured analysis JSON into readable chat output
-function formatAnalyzedFlights(analysis, originalFlights) {
-  const { summary, categorized_flights, flights } = analysis;
+// Parse passenger details from text like "2 adults 1 child business" or "2, economy"
+function parsePassengerDetails(text) {
+  const lower = text.toLowerCase();
 
-  // Build a lookup for booking URLs from original data
-  const urlMap = {};
+  // Try explicit "N adult(s)" first, then fall back to first bare number
+  const adultMatch = lower.match(/(\d+)\s*adult/);
+  const bareNum = lower.match(/^(\d+)/);
+  const adults = parseInt(adultMatch?.[1] || bareNum?.[1] || '1');
+
+  const children = parseInt(lower.match(/(\d+)\s*child/)?.[1] || '0');
+  const infants  = parseInt(lower.match(/(\d+)\s*infant/)?.[1] || '0');
+
+  let cabin = 'economy';
+  if (/business/i.test(text)) cabin = 'business';
+  else if (/premium/i.test(text)) cabin = 'premium_economy';
+
+  return { adults, children, infants, cabin };
+}
+
+
+// Format flight list — clean numbered format
+function formatAnalyzedFlights(analysis, originalFlights, route) {
+  const { summary, flights } = analysis;
+
+  // Build lookup from original flight data
+  const originalMap = {};
   for (const f of (originalFlights || [])) {
-    urlMap[f.flightNumber] = f.bookingUrl;
-    urlMap[f.flightNumber + '_premium'] = f.price?.premiumEconomy || 0;
-    urlMap[f.flightNumber + '_business'] = f.price?.business || 0;
+    originalMap[f.flightNumber] = f;
   }
 
-  let out = '';
+  const routeLabel = route ? `${route.origin} → ${route.destination}` : '';
+  const date = route?.date || '';
 
-  // Header
-  out += `✈️ **Flight Analysis**\n`;
-  out += `🔍 ${summary.total_flights} flights found\n`;
-  out += `💡 ${summary.price_insight}\n\n`;
+  let out = `✈️ **${routeLabel}**\n`;
+  if (date) out += `📅 ${date}\n`;
+  out += `🔍 ${summary.total_flights} flights found\n\n`;
 
-  // Highlights
-  out += `📊 **Highlights:**\n`;
-  out += `• 💰 Cheapest: **${summary.cheapest_flight_number}**\n`;
-  out += `• ⚡ Fastest: **${summary.fastest_flight_number}**\n`;
-  out += `• 🏆 Best Value: **${summary.best_value_flight_number}**\n\n`;
+  flights.forEach((f, i) => {
+    const orig = originalMap[f.flight_number];
+    const stopsText = f.stops === 0 ? 'Non-stop' : `${f.stops} stop${f.stops > 1 ? 's' : ''} via ${f.layover_city || ''}`;
+    const badge = f.price_category === 'Good deal' ? '🟢' : f.price_category === 'High' ? '🔴' : '';
 
-  // Flights grouped by time of day
-  const timeSlots = [
-    { key: 'morning',   label: '🌅 Morning (05:00–11:59)',   emoji: '🌅' },
-    { key: 'afternoon', label: '☀️ Afternoon (12:00–16:59)', emoji: '☀️' },
-    { key: 'evening',   label: '🌆 Evening (17:00–20:59)',   emoji: '🌆' },
-    { key: 'night',     label: '🌙 Night (21:00–04:59)',     emoji: '🌙' },
-  ];
+    out += `*${i + 1}. ${f.airline} · ${f.flight_number}*\n`;
+    out += `🕐 ${f.departure_time} → ${f.arrival_time} · ${Math.floor(f.duration_minutes / 60)}h ${f.duration_minutes % 60}m · ${stopsText}\n`;
 
-  for (const slot of timeSlots) {
-    const group = categorized_flights[slot.key] || [];
-    if (group.length === 0) continue;
+    // Prices
+    const premiumPrice = orig?.price?.premiumEconomy || 0;
+    const bizPrice = orig?.price?.business || 0;
+    out += `💺 Economy ₹${f.price.toLocaleString('en-IN')}${badge ? ' ' + badge : ''}`;
+    if (premiumPrice > 0) out += ` · Premium ₹${premiumPrice.toLocaleString('en-IN')}`;
+    if (bizPrice > 0) out += ` · Business ₹${bizPrice.toLocaleString('en-IN')}`;
+    out += '\n\n';
+  });
 
-    out += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    out += `${slot.label}\n\n`;
-
-    for (const fn of group) {
-      const f = flights.find((x) => x.flight_number === fn);
-      if (!f) continue;
-
-      const stopsText = f.stops === 0 ? 'Non-stop' : `${f.stops} stop${f.stops > 1 ? 's' : ''} via ${f.layover_city || ''}`;
-      const categoryBadge = f.price_category === 'Good deal' ? '🟢' : f.price_category === 'High' ? '🔴' : '🟡';
-      const pctSign = f.price_vs_average_percent > 0 ? '+' : '';
-      const urls = urlMap[f.flight_number];
-
-      out += `**${f.airline}** · ${f.flight_number}\n`;
-      out += `🕐 ${f.departure_time} → ${f.arrival_time} · ${Math.floor(f.duration_minutes / 60)}h ${f.duration_minutes % 60}m · ${stopsText}\n`;
-
-      // Economy price + badge
-      out += `💺 Economy: **₹${f.price.toLocaleString('en-IN')}** ${categoryBadge} (${pctSign}${f.price_vs_average_percent}% vs avg)`;
-      if (urls?.economy) out += ` — [Book](${urls.economy})`;
-      out += '\n';
-
-      // Premium economy if available
-      const premiumPrice = urlMap[f.flight_number + '_premium'];
-      if (premiumPrice > 0) {
-        out += `💺 Premium Economy: **₹${premiumPrice.toLocaleString('en-IN')}**`;
-        if (urls?.premiumEconomy) out += ` — [Book](${urls.premiumEconomy})`;
-        out += '\n';
-      }
-
-      // Business if available
-      const bizPrice = urlMap[f.flight_number + '_business'];
-      if (bizPrice > 0) {
-        out += `💼 Business: **₹${bizPrice.toLocaleString('en-IN')}**`;
-        if (urls?.business) out += ` — [Book](${urls.business})`;
-        out += '\n';
-      }
-
-      if (f.aircraft_type) out += `✈️ ${f.aircraft_type}\n`;
-      out += '\n';
-    }
-  }
+  out += `💰 Cheapest: **${summary.cheapest_flight_number}** · ⚡ Fastest: **${summary.fastest_flight_number}**\n`;
+  out += `📌 To book, reply: *"book [flight number]"* e.g. book ${flights[0]?.flight_number || ''}`;
 
   return out.trim();
 }
 
-async function generateResponse(messageText, conversationHistory = [], chatId = 'default', messageTimestamp = Date.now()) {
+// Detect booking intent — must refer to selecting an existing flight, not a new search
+function isBookFlightIntent(text) {
+  // Exclude new flight search queries
+  if (/\bfrom\b.+\bto\b/i.test(text) && /\b(flight|fly)\b/i.test(text)) return false;
+  if (/\bflight(s)?\s+from\b/i.test(text)) return false;
+
+  return /\bbook\s+(\d{1,2}(st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b/i.test(text) ||
+    /\bbook\s+[A-Z]{2}\s*\d{3,4}\b/i.test(text) ||
+    /\bbook\s+(it|this|now|the flight|indigo|spicejet|air india|akasa|star air)\b/i.test(text) ||
+    /\bbook\s+(cheapest|fastest|best|best value|non.?stop|direct)\b/i.test(text) ||
+    /\bbook\b/i.test(text) && /\b(cheapest|fastest|best value|non.?stop|direct flight)\b/i.test(text) ||
+    /\bi('ll| will) book\b/i.test(text) ||
+    /\bproceed\s*(with|to book)?\b/i.test(text) ||
+    /\bconfirm\s*(booking|flight|this)\b/i.test(text);
+}
+
+// Extract flight number or rank index from text
+// Returns { flightNumber, rankIndex }
+function extractFlightRef(text, flights = []) {
+  const lower = text.toLowerCase().trim();
+
+  // 1. Explicit flight code e.g. "6E 6813"
+  const codeMatch = text.match(/\b([A-Z]{2})\s*(\d{3,4})\b/i);
+  if (codeMatch) {
+    return { flightNumber: `${codeMatch[1].toUpperCase()} ${codeMatch[2]}`, rankIndex: null };
+  }
+
+  // 2. Superlatives — find by sorting cached flights
+  if (/\bcheapest\b/i.test(text) && flights.length) {
+    const idx = flights.reduce((best, f, i) =>
+      (f.price.economy || Infinity) < (flights[best].price.economy || Infinity) ? i : best, 0);
+    return { flightNumber: null, rankIndex: idx };
+  }
+  if (/\bfastest\b/i.test(text) && flights.length) {
+    const toMins = d => { const m = d.match(/(\d+)h\s*(\d+)?m?/); return m ? +m[1]*60+(+m[2]||0) : 9999; };
+    const idx = flights.reduce((best, f, i) =>
+      toMins(f.duration) < toMins(flights[best].duration) ? i : best, 0);
+    return { flightNumber: null, rankIndex: idx };
+  }
+  if (/\b(best|best value)\b/i.test(text) && flights.length) {
+    // best value = lowest price/duration ratio
+    const toMins = d => { const m = d.match(/(\d+)h\s*(\d+)?m?/); return m ? +m[1]*60+(+m[2]||0) : 9999; };
+    const idx = flights.reduce((best, f, i) => {
+      const ratio = (f.price.economy || Infinity) / (toMins(f.duration) || 1);
+      const bestRatio = (flights[best].price.economy || Infinity) / (toMins(flights[best].duration) || 1);
+      return ratio < bestRatio ? i : best;
+    }, 0);
+    return { flightNumber: null, rankIndex: idx };
+  }
+  if (/\b(non.?stop|direct)\b/i.test(text) && flights.length) {
+    const idx = flights.findIndex(f => f.stops === 0);
+    if (idx >= 0) return { flightNumber: null, rankIndex: idx };
+  }
+
+  // 3. Word ordinals
+  const wordOrdinals = {
+    first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
+    sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10,
+  };
+  for (const [word, rank] of Object.entries(wordOrdinals)) {
+    if (new RegExp(`\\b${word}\\b`).test(lower)) {
+      return { flightNumber: null, rankIndex: rank - 1 };
+    }
+  }
+
+  // 4. Numeric ordinals: "5th", "3rd", "2nd", "1st", or bare number
+  const ordinalMatch = lower.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
+  if (ordinalMatch) {
+    const n = parseInt(ordinalMatch[1]);
+    if (n >= 1 && n <= 20) return { flightNumber: null, rankIndex: n - 1 };
+  }
+
+  // 5. Airline name match
+  const byAirline = flights.findIndex(f => lower.includes(f.airline.toLowerCase().split(' ')[0]));
+  if (byAirline >= 0) return { flightNumber: null, rankIndex: byAirline };
+
+  return { flightNumber: null, rankIndex: null };
+}
+
+// Build booking confirmation card with pre-filled URL shown directly in chat
+function buildBookingCard(flight, route, passengerDetails) {
+  const { cabin } = passengerDetails;
+  const stops = flight.stops === 0 ? 'Non-stop' : `${flight.stops} stop via ${flight.stopDetails.join(', ')}`;
+
+  const priceKey = cabin === 'business' ? 'business' : cabin === 'premium_economy' ? 'premiumEconomy' : 'economy';
+  const price = flight.price[priceKey] || flight.price.economy;
+
+  let out = `✈️ *${flight.airline} · ${flight.flightNumber}*\n`;
+  out += `📅 ${route.date}\n`;
+  out += `🛫 ${flight.departure.time} ${flight.departure.airport} → ${flight.arrival.time} ${flight.arrival.airport}\n`;
+  out += `⏱ ${flight.duration} · ${stops}\n`;
+  out += `💰 ₹${price.toLocaleString('en-IN')}\n\n`;
+  out += `👉 Book on Google Flights (cheapest platform):\n`;
+  out += flight.bookingUrl;
+  return out;
+}
+
+// Detect if user wants to raise a support ticket
+function isTicketIntent(text) {
+  return /\b(raise\s+a?\s*ticket|create\s+a?\s*ticket|submit\s+a?\s*(ticket|complaint|issue)|report\s+(an?\s+)?(issue|problem|bug)|i\s+have\s+an?\s+(issue|problem|complaint)|need\s+support|contact\s+support|raise\s+issue|log\s+a?\s*complaint)\b/i.test(text);
+}
+
+// Handle ticket creation flow — returns response string or null if not a ticket flow
+async function handleTicketFlow(text, chatId, platform, userName) {
+  if (isTicketIntent(text)) {
+    pendingTickets.set(chatId, { platform, userName });
+    return '🎫 Sure! Please describe your issue in detail and I\'ll raise a support ticket for you.';
+  }
+
+  if (pendingTickets.has(chatId)) {
+    const { platform: ticketPlatform, userName: ticketUser } = pendingTickets.get(chatId);
+    pendingTickets.delete(chatId);
+
+    const ticketId = await createTicket(chatId, ticketPlatform, ticketUser, text);
+    if (ticketId) {
+      return `✅ Your support ticket has been raised!\n\n🎫 *Ticket ID:* ${ticketId}\n📝 *Issue:* ${text}\n\nOur team will review it shortly. Thank you!`;
+    }
+    return '❌ Failed to raise the ticket. Please try again later.';
+  }
+
+  return null;
+}
+
+// user says "book ..." — immediately return booking link
+function handleBookFlight(text, cachedResults) {
+  if (!cachedResults) return '⚠️ I don\'t have your flight search cached. Please search again (e.g. "flights from Bangalore to Ghaziabad tomorrow") and then say book.';
+
+  const flights = cachedResults.flights || [];
+  const { flightNumber, rankIndex } = extractFlightRef(text, flights);
+
+  let flight;
+  if (flightNumber) {
+    flight = flights.find((f) =>
+      f.flightNumber.replace(' ', '').toLowerCase() === flightNumber.replace(' ', '').toLowerCase());
+  } else if (rankIndex !== null && rankIndex >= 0) {
+    flight = flights[rankIndex];
+  } else {
+    flight = flights[0]; // default to first
+  }
+
+  if (!flight) return `❌ Could not find that flight. Please say "book [flight number]" e.g. book 6E 6813`;
+
+  return buildBookingCard(flight, cachedResults.route, { adults: 1, children: 0, infants: 0, cabin: 'economy' });
+}
+
+async function generateResponse(messageText, conversationHistory = [], chatId = 'default', messageTimestamp = Date.now(), platform = 'telegram', userName = 'Unknown') {
   try {
     const queryType = detectQueryType(messageText);
     const dateContext = buildDateContext(messageTimestamp);
     let searchContext = '';
     let flightData = null;
+
+    // Support ticket flow
+    const ticketResponse = await handleTicketFlow(messageText, chatId, platform, userName);
+    if (ticketResponse !== null) return ticketResponse;
+
+    // user says "book [flight number]" — immediately return booking link
+    if (isBookFlightIntent(messageText)) {
+      return handleBookFlight(messageText, lastFlightResults.get(chatId));
+    }
 
     // Use Google Flights for flight searches
     if (isFlightQuery(messageText) && needsSearch(messageText)) {
@@ -490,17 +630,13 @@ async function generateResponse(messageText, conversationHistory = [], chatId = 
         const analysisInput = buildAnalysisInput(flightResults);
         const analysis = await analyzeFlights(analysisInput);
         if (analysis) {
-          return formatAnalyzedFlights(analysis, flightResults.flights);
+          return formatAnalyzedFlights(analysis, flightResults.flights, flightResults.route);
         }
         // Fallback to plain format if analysis fails
         return formatFlightResults(flightResults);
       } else if (flightResults.error) {
-        // If Google Flights fails, fall back to web search
-        console.log(`⚠️ Google Flights: ${flightResults.error}, falling back to web search`);
-        const results = await searchWeb(messageText, queryType);
-        if (results) {
-          searchContext = buildSearchContext(results);
-        }
+        console.log(`⚠️ Google Flights: ${flightResults.error}`);
+        return `❌ ${flightResults.error}\n\nPlease check the route or date and try again.`;
       }
     } else if (queryType === 'flight' && lastFlightResults.has(chatId)) {
       // Follow-up query about flights - use stored results
@@ -563,6 +699,7 @@ async function generateResponse(messageText, conversationHistory = [], chatId = 
 
     // Add context instruction for follow-up questions
     systemPrompt += `\n\nIMPORTANT: Maintain conversation continuity. If the user asks follow-up questions like "which is cheapest?", "tell me more", "what about budget options?", etc., refer to the previous context. Do not switch topics unless the user explicitly asks about something completely different.`;
+    systemPrompt += `\n\nNEVER ask for personal details (name, date of birth, gender, passport, phone, email, payment details). NEVER simulate a booking form. Booking is handled externally — just tell the user to reply "book [flight number]".`;
 
     // Build messages array with history
     const messages = [{ role: 'system', content: systemPrompt }];

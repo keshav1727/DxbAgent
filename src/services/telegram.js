@@ -104,7 +104,7 @@ function init() {
             handleTopicChange(chatId, transcribedText);
 
             const history = getMessages(chatId);
-            const response = await generateResponse(transcribedText, history, chatId, msg.date * 1000);
+            const response = await generateResponse(transcribedText, history, chatId, msg.date * 1000, 'telegram', userName);
 
             // Save to memory
             addMessage(chatId, 'user', transcribedText);
@@ -140,7 +140,7 @@ function init() {
           await bot.sendMessage(chatId, `🎤 *Transcription:* "${transcribedText}"`, { parse_mode: 'Markdown' });
 
           await bot.sendChatAction(chatId, 'typing');
-          const response = await generateResponse(transcribedText, [], chatId, msg.date * 1000);
+          const response = await generateResponse(transcribedText, [], chatId, msg.date * 1000, 'telegram', userName);
           await sendLongMessage(chatId, response);
           saveChatMessage(chatId, 'telegram', userName, transcribedText, response, detectTopic(transcribedText) || 'general');
           console.log('✅ Audio response sent');
@@ -206,7 +206,7 @@ function init() {
 
       // Get conversation history and generate response with context
       const history = getMessages(chatId);
-      const response = await generateResponse(fullContext, history, chatId, msg.date * 1000);
+      const response = await generateResponse(fullContext, history, chatId, msg.date * 1000, 'telegram', userName);
 
       // Save to memory
       addMessage(chatId, 'user', fullContext);

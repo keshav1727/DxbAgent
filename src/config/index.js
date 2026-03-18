@@ -18,6 +18,9 @@ module.exports = {
   serpapi: {
     apiKey: process.env.SERPAPI_API_KEY,
   },
+  rapidapi: {
+    apiKey: process.env.RAPIDAPI_KEY,
+  },
   mongodb: {
     uri: process.env.MONGODB_URI,
   },

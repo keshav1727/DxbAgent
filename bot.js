@@ -40,7 +40,7 @@ console.log('🤖 Multi-Platform AI Agent starting...');
   console.log('💬 WhatsApp: Active');
   console.log('🔍 Tavily: Real-time search');
   console.log(`✈️ SerpAPI Flights: ${flightsEnabled ? 'Real-time Google Flights' : 'Not configured (add SERPAPI_API_KEY)'}`);
-  console.log(`🏨 SerpAPI Hotels: ${hotelsEnabled ? 'Real-time Google Hotels' : 'Not configured (add SERPAPI_API_KEY)'}`);
+  console.log(`🏨 Booking.com Hotels: ${hotelsEnabled ? 'Real-time Booking.com (RapidAPI)' : 'Not configured (add RAPIDAPI_KEY)'}`);
   console.log('🤖 GPT-4.1 AI');
   console.log('');
   console.log('🎯 Capabilities: Flights, Visa, Weather, News, Search');

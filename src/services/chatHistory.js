@@ -1,6 +1,19 @@
 const mongoose = require('mongoose');
 const config = require('../config');
 
+// Support Ticket schema
+const ticketSchema = new mongoose.Schema({
+  ticketId: { type: String, required: true, unique: true },
+  chatId: { type: String, required: true },
+  platform: { type: String, required: true, enum: ['whatsapp', 'telegram'] },
+  userName: { type: String, default: 'Unknown' },
+  issue: { type: String, required: true },
+  status: { type: String, enum: ['open', 'closed'], default: 'open' },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const Ticket = mongoose.models.Ticket || mongoose.model('Ticket', ticketSchema);
+
 // ChatMessage schema
 const chatMessageSchema = new mongoose.Schema({
   chatId: { type: String, required: true, index: true },
@@ -54,4 +67,25 @@ async function saveChatMessage(chatId, platform, userName, userMessage, botRespo
   }
 }
 
-module.exports = { connectDB, saveChatMessage, ChatMessage };
+async function createTicket(chatId, platform, userName, issue) {
+  if (!isConnected) return null;
+
+  try {
+    const ticketId = `TKT-${Date.now().toString(36).toUpperCase()}`;
+    const ticket = await Ticket.create({
+      ticketId,
+      chatId: String(chatId),
+      platform,
+      userName,
+      issue,
+      status: 'open',
+      createdAt: new Date(),
+    });
+    return ticket.ticketId;
+  } catch (error) {
+    console.error('❌ Error creating ticket:', error.message);
+    return null;
+  }
+}
+
+module.exports = { connectDB, saveChatMessage, ChatMessage, createTicket, Ticket };
